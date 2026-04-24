@@ -1450,6 +1450,8 @@ pub struct TokenAccountEvent {
     pub lamports: u64,
     pub owner: Pubkey,
     pub rent_epoch: u64,
+    #[serde(default)]
+    pub mint: Pubkey,
     pub amount: Option<u64>,
     pub token_owner: Pubkey,
 }

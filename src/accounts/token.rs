@@ -9,6 +9,7 @@
 //! - 快速路径：优先使用零拷贝，失败时回退到完整解析
 //! - 智能检测：根据数据长度和 owner 自动识别账户类型
 
+use crate::accounts::utils::{read_pubkey, read_u64_le};
 use crate::core::events::{EventMetadata, TokenAccountEvent, TokenInfoEvent};
 use crate::DexEvent;
 use solana_sdk::pubkey::Pubkey;
@@ -92,6 +93,8 @@ fn parse_mint_fast(account: &AccountData, metadata: EventMetadata) -> Option<Dex
 #[inline]
 fn parse_token_fast(account: &AccountData, metadata: EventMetadata) -> Option<DexEvent> {
     const TOKEN_ACCOUNT_SIZE: usize = 165;
+    const MINT_OFFSET: usize = 0;
+    const OWNER_OFFSET: usize = 32;
     const AMOUNT_OFFSET: usize = 64;
 
     if account.data.len() < AMOUNT_OFFSET + 8 {
@@ -103,8 +106,9 @@ fn parse_token_fast(account: &AccountData, metadata: EventMetadata) -> Option<De
         return None;
     }
 
-    let amount_bytes: [u8; 8] = account.data[AMOUNT_OFFSET..AMOUNT_OFFSET + 8].try_into().ok()?;
-    let amount = u64::from_le_bytes(amount_bytes);
+    let mint = read_pubkey(&account.data, MINT_OFFSET)?;
+    let token_owner = read_pubkey(&account.data, OWNER_OFFSET)?;
+    let amount = read_u64_le(&account.data, AMOUNT_OFFSET)?;
 
     let event = TokenAccountEvent {
         metadata,
@@ -113,8 +117,9 @@ fn parse_token_fast(account: &AccountData, metadata: EventMetadata) -> Option<De
         lamports: account.lamports,
         owner: account.owner,
         rent_epoch: account.rent_epoch,
+        mint,
         amount: Some(amount),
-        token_owner: account.owner,
+        token_owner,
     };
 
     Some(DexEvent::TokenAccount(event))
@@ -163,6 +168,7 @@ fn parse_token_with_extensions(account: &AccountData, metadata: EventMetadata) -
         if let Ok(account_state) = StateWithExtensions::<Account2022>::unpack(&account.data) {
             // 转换 spl_token_2022::Pubkey 到 solana_sdk::Pubkey
             let token_owner = Pubkey::new_from_array(account_state.base.owner.to_bytes());
+            let mint = Pubkey::new_from_array(account_state.base.mint.to_bytes());
             let event = TokenAccountEvent {
                 metadata,
                 pubkey: account.pubkey,
@@ -170,6 +176,7 @@ fn parse_token_with_extensions(account: &AccountData, metadata: EventMetadata) -
                 lamports: account.lamports,
                 owner: account.owner,
                 rent_epoch: account.rent_epoch,
+                mint,
                 amount: Some(account_state.base.amount),
                 token_owner,
             };
@@ -181,6 +188,7 @@ fn parse_token_with_extensions(account: &AccountData, metadata: EventMetadata) -
     if let Ok(token_account) = Account::unpack(&account.data) {
         // 转换 spl_token::Pubkey 到 solana_sdk::Pubkey
         let token_owner = Pubkey::new_from_array(token_account.owner.to_bytes());
+        let mint = Pubkey::new_from_array(token_account.mint.to_bytes());
         let event = TokenAccountEvent {
             metadata,
             pubkey: account.pubkey,
@@ -188,6 +196,7 @@ fn parse_token_with_extensions(account: &AccountData, metadata: EventMetadata) -
             lamports: account.lamports,
             owner: account.owner,
             rent_epoch: account.rent_epoch,
+            mint,
             amount: Some(token_account.amount),
             token_owner,
         };
@@ -233,6 +242,11 @@ mod tests {
     fn test_parse_token_fast() {
         // 创建一个模拟的 Token Account 数据
         let mut data = vec![0u8; 165];
+        let mint = Pubkey::new_unique();
+        let token_owner = Pubkey::new_unique();
+        // 设置 mint (offset 0) 和 token owner (offset 32)
+        data[0..32].copy_from_slice(mint.as_ref());
+        data[32..64].copy_from_slice(token_owner.as_ref());
         // 设置 amount (offset 64)
         data[64..72].copy_from_slice(&5000u64.to_le_bytes());
 
@@ -250,7 +264,9 @@ mod tests {
 
         assert!(event.is_some());
         if let Some(DexEvent::TokenAccount(token_account)) = event {
+            assert_eq!(token_account.mint, mint);
             assert_eq!(token_account.amount, Some(5000));
+            assert_eq!(token_account.token_owner, token_owner);
         }
     }
 }
