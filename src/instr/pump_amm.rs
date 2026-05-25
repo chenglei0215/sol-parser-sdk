@@ -132,6 +132,7 @@ fn parse_buy_instruction(
         ev.coin_creator_vault_ata = get_account(accounts, 17).unwrap_or_default();
         ev.coin_creator_vault_authority = get_account(accounts, 18).unwrap_or_default();
     }
+    ev.all_instruction_accounts = accounts.to_vec();
     Some(DexEvent::PumpSwapBuy(ev))
 }
 
@@ -187,6 +188,7 @@ fn parse_buy_exact_quote_in_instruction(
         ev.coin_creator_vault_ata = get_account(accounts, 17).unwrap_or_default();
         ev.coin_creator_vault_authority = get_account(accounts, 18).unwrap_or_default();
     }
+    ev.all_instruction_accounts = accounts.to_vec();
     Some(DexEvent::PumpSwapBuy(ev))
 }
 
@@ -245,6 +247,7 @@ fn parse_sell_instruction(
         ev.coin_creator_vault_ata = get_account(accounts, 17).unwrap_or_default();
         ev.coin_creator_vault_authority = get_account(accounts, 18).unwrap_or_default();
     }
+    ev.all_instruction_accounts = accounts.to_vec();
     Some(DexEvent::PumpSwapSell(ev))
 }
 

@@ -346,6 +346,9 @@ pub struct PumpSwapBuyEvent {
     pub base_token_program: Pubkey,
     #[borsh(skip)]
     pub quote_token_program: Pubkey,
+    /// 完整的指令账户列表（从指令解析时填充，用于提取协议新增的未知账户如 buyback_fee_recipient）
+    #[borsh(skip)]
+    pub all_instruction_accounts: Vec<Pubkey>,
 }
 
 /// PumpSwap Sell Event
@@ -402,6 +405,9 @@ pub struct PumpSwapSellEvent {
     pub base_token_program: Pubkey,
     #[borsh(skip)]
     pub quote_token_program: Pubkey,
+    /// 完整的指令账户列表（从指令解析时填充，用于提取协议新增的未知账户如 buyback_fee_recipient）
+    #[borsh(skip)]
+    pub all_instruction_accounts: Vec<Pubkey>,
 }
 
 /// PumpSwap Create Pool Event
