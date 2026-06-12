@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 // 核心模块 - 扁平化结构
 pub mod accounts; // 账户解析器
 pub mod common;

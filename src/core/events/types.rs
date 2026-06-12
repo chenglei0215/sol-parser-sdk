@@ -3,9 +3,34 @@
 //! 基于您提供的回调事件列表，定义所有需要的具体事件类型
 
 // use prost_types::Timestamp;
+
 use borsh::BorshDeserialize;
 use serde::{Deserialize, Serialize};
-use solana_sdk::{pubkey::Pubkey, signature::Signature};
+use solana_sdk::{pubkey, pubkey::Pubkey, signature::Signature};
+
+/// Solscan SOL quote-mint sentinel used when PumpFun legacy events omit quote_mint.
+///
+/// PumpFun native-SOL instructions and older trade logs do not carry a real SPL quote mint.
+/// We expose the same SOL placeholder Solscan displays instead of `Pubkey::default()`.
+pub const PUMPFUN_SOLSCAN_SOL_QUOTE_MINT: Pubkey =
+    pubkey!("So11111111111111111111111111111111111111111");
+
+/// SPL wrapped-SOL mint.
+pub const PUMPFUN_WSOL_QUOTE_MINT: Pubkey = pubkey!("So11111111111111111111111111111111111111112");
+
+#[inline]
+pub fn normalize_pumpfun_quote_mint(quote_mint: Pubkey) -> Pubkey {
+    if quote_mint == Pubkey::default() {
+        PUMPFUN_SOLSCAN_SOL_QUOTE_MINT
+    } else {
+        quote_mint
+    }
+}
+
+#[inline]
+pub fn is_pumpfun_solscan_sol_quote_mint(quote_mint: Pubkey) -> bool {
+    normalize_pumpfun_quote_mint(quote_mint) == PUMPFUN_SOLSCAN_SOL_QUOTE_MINT
+}
 
 /// 基础元数据 - 所有事件共享的字段
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -20,15 +45,34 @@ pub struct EventMetadata {
     pub recent_blockhash: Option<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pumpfun_default_quote_mint_uses_solscan_sol_sentinel() {
+        let quote_mint = normalize_pumpfun_quote_mint(Pubkey::default());
+
+        assert_eq!(quote_mint, PUMPFUN_SOLSCAN_SOL_QUOTE_MINT);
+        assert_eq!(quote_mint.to_string(), "So11111111111111111111111111111111111111111");
+    }
+
+    #[test]
+    fn pumpfun_wsol_quote_mint_is_preserved() {
+        assert_eq!(normalize_pumpfun_quote_mint(PUMPFUN_WSOL_QUOTE_MINT), PUMPFUN_WSOL_QUOTE_MINT);
+        assert!(!is_pumpfun_solscan_sol_quote_mint(PUMPFUN_WSOL_QUOTE_MINT));
+    }
+}
+
 /// Block Meta Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockMetaEvent {
     pub metadata: EventMetadata,
 }
 
-/// Bonk Pool Create Event
+/// RaydiumLaunchlab Pool Create Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkPoolCreateEvent {
+pub struct RaydiumLaunchlabPoolCreateEvent {
     pub metadata: EventMetadata,
     pub base_mint_param: BaseMintParam,
     pub pool_state: Pubkey,
@@ -43,10 +87,10 @@ pub struct BaseMintParam {
     pub decimals: u8,
 }
 
-/// Bonk Trade Event
+/// RaydiumLaunchlab Trade Event
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkTradeEvent {
+pub struct RaydiumLaunchlabTradeEvent {
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
 
@@ -71,9 +115,9 @@ pub enum TradeDirection {
     Sell,
 }
 
-/// Bonk Migrate AMM Event
+/// RaydiumLaunchlab Migrate AMM Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkMigrateAmmEvent {
+pub struct RaydiumLaunchlabMigrateAmmEvent {
     pub metadata: EventMetadata,
     pub old_pool: Pubkey,
     pub new_pool: Pubkey,
@@ -84,8 +128,8 @@ pub struct BonkMigrateAmmEvent {
 /// PumpFun Trade Event - 基于官方IDL定义
 ///
 /// 字段来源标记:
-/// - [EVENT]: 来自原始IDL事件定义，由程序日志直接解析获得
-/// - [INSTRUCTION]: 来自指令解析，用于补充事件缺失的上下文信息
+/// - EVENT: 来自原始IDL事件定义，由程序日志直接解析获得
+/// - INSTRUCTION: 来自指令解析，用于补充事件缺失的上下文信息
 #[derive(Debug, Clone, Serialize, Deserialize, Default, BorshDeserialize)]
 pub struct PumpFunTradeEvent {
     #[borsh(skip)]
@@ -115,7 +159,8 @@ pub struct PumpFunTradeEvent {
     pub total_claimed_tokens: u64,
     pub current_sol_volume: u64,
     pub last_update_timestamp: i64,
-    /// Instruction name: "buy" | "sell" | "buy_exact_sol_in"
+    /// Instruction name as emitted by the program, for example `"buy"`, `"buy_v2"`,
+    /// `"sell"`, `"sell_v2"`, `"buy_exact_sol_in"`, or `"buy_exact_quote_in_v2"`.
     pub ix_name: String,
     /// 与链上 / Explorer `tradeEvent` 中 `mayhemMode` 一致（gRPC 日志解析填充；勿用 fee 地址推断）。
     pub mayhem_mode: bool,
@@ -123,32 +168,87 @@ pub struct PumpFunTradeEvent {
     pub cashback_fee_basis_points: u64,
     /// Cashback amount (PUMP_CASHBACK_README)
     pub cashback: u64,
+    pub buyback_fee_basis_points: u64,
+    pub buyback_fee: u64,
+    pub shareholders: Vec<PumpFeesShareholder>,
+    pub quote_mint: Pubkey,
+    pub quote_amount: u64,
+    pub virtual_quote_reserves: u64,
+    pub real_quote_reserves: u64,
     /// 是否返现代币（由 cashback_fee_basis_points > 0 推导，供 sol-trade-sdk 等构造 sell 指令用）
     #[borsh(skip)]
     pub is_cashback_coin: bool,
 
-    // === Instruction parameter fields (reserved for future use, DO NOT delete) ===
-    // pub amount: u64,                     // buy/sell.args.amount
-    // pub max_sol_cost: u64,               // buy.args.maxSolCost
-    // pub min_sol_output: u64,             // sell.args.minSolOutput
+    // === Instruction parameter fields (not present in the on-chain TradeEvent Borsh payload) ===
+    #[borsh(skip)]
+    pub amount: u64, // buy/sell.args.amount
+    #[borsh(skip)]
+    pub max_sol_cost: u64, // buy.args.max_sol_cost
+    #[borsh(skip)]
+    pub min_sol_output: u64, // sell.args.min_sol_output
+    #[borsh(skip)]
+    pub spendable_sol_in: u64, // buy_exact_sol_in.args.spendable_sol_in
+    #[borsh(skip)]
+    pub spendable_quote_in: u64, // buy_exact_quote_in_v2.args.spendable_quote_in
+    #[borsh(skip)]
+    pub min_tokens_out: u64, // buy_exact*.args.min_tokens_out
 
     // === 指令账户字段 (从指令账户填充，不在 Borsh 数据中) ===
-    // pub global: Pubkey,                  // 0
     #[borsh(skip)]
-    pub bonding_curve: Pubkey, // 3
+    pub global: Pubkey, // legacy 0 / v2 0
     #[borsh(skip)]
-    pub associated_bonding_curve: Pubkey, // 4
-    // pub associated_user: Pubkey,         // 5
+    pub bonding_curve: Pubkey, // legacy 3 / v2 10
     #[borsh(skip)]
-    pub token_program: Pubkey, // sell - 9 / buy - 8
+    pub bonding_curve_v2: Pubkey, // legacy sell cashback remaining_accounts[1]
     #[borsh(skip)]
-    pub creator_vault: Pubkey, // sell - 8 / buy - 9
-    /// 第 17 个指令账户 (index 16)，区块浏览器显示为 "Account"，部分 buy/sell 会传入
+    pub associated_bonding_curve: Pubkey, // legacy 4 / v2 associated_base_bonding_curve 11
+    #[borsh(skip)]
+    pub associated_user: Pubkey, // legacy 5 / v2 associated_base_user 14
+    #[borsh(skip)]
+    pub system_program: Pubkey, // legacy 7 / v2 buy 24, sell 23
+    #[borsh(skip)]
+    pub token_program: Pubkey, // legacy sell 9 / buy 8 / v2 base_token_program 3
+    #[borsh(skip)]
+    pub quote_token_program: Pubkey, // v2 4
+    #[borsh(skip)]
+    pub associated_token_program: Pubkey, // v2 5
+    #[borsh(skip)]
+    pub creator_vault: Pubkey, // legacy sell 8 / buy 9 / v2 16
+    #[borsh(skip)]
+    pub associated_quote_fee_recipient: Pubkey, // v2 7
+    #[borsh(skip)]
+    pub buyback_fee_recipient: Pubkey, // v2 8
+    #[borsh(skip)]
+    pub associated_quote_buyback_fee_recipient: Pubkey, // v2 9
+    #[borsh(skip)]
+    pub associated_quote_bonding_curve: Pubkey, // v2 12
+    #[borsh(skip)]
+    pub associated_quote_user: Pubkey, // v2 15
+    #[borsh(skip)]
+    pub associated_creator_vault: Pubkey, // v2 17
+    #[borsh(skip)]
+    pub sharing_config: Pubkey, // v2 18
+    #[borsh(skip)]
+    pub event_authority: Pubkey, // legacy buy 10 / sell 10 / v2 buy 25, sell 24
+    #[borsh(skip)]
+    pub program: Pubkey, // legacy buy 11 / sell 11 / v2 buy 26, sell 25
+    #[borsh(skip)]
+    pub global_volume_accumulator: Pubkey, // buy/exact buy legacy 12 / v2 buy 19
+    #[borsh(skip)]
+    pub user_volume_accumulator: Pubkey, // legacy buy/exact buy 13 / v2 buy 20, sell 19
+    #[borsh(skip)]
+    pub associated_user_volume_accumulator: Pubkey, // v2 buy 21 / sell 20
+    #[borsh(skip)]
+    pub fee_config: Pubkey, // legacy buy 14 / sell 12 / v2 buy 22, sell 21
+    #[borsh(skip)]
+    pub fee_program: Pubkey, // legacy buy 15 / sell 13 / v2 buy 23, sell 22
+    /// Legacy fallback alias for the last post-upgrade extra account. Prefer
+    /// `bonding_curve_v2` and `buyback_fee_recipient` for structured access.
     #[borsh(skip)]
     pub account: Option<Pubkey>,
 }
 
-/// PumpFun Migrate Event
+/// PumpFun Migrate Event — bonding curve 完成向池子（如 Pump AMM/Raydium）迁移等
 #[derive(Debug, Clone, Serialize, Deserialize, Default, BorshDeserialize)]
 pub struct PumpFunMigrateEvent {
     #[borsh(skip)]
@@ -178,6 +278,159 @@ pub struct PumpFunMigrateEvent {
     // pub pool_quote_token_account: Pubkey,
 }
 
+// ---------- pump-fees IDL：`idls/pump_fees.json`（Program `pfeeUx...`）----------
+
+/// IDL `Shareholder`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, BorshDeserialize)]
+pub struct PumpFeesShareholder {
+    pub address: Pubkey,
+    pub share_bps: u16,
+}
+
+/// IDL `ConfigStatus`（Anchor Borsh：enum 判别）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PumpFeesConfigStatus {
+    Paused,
+    Active,
+}
+
+/// IDL `Fees`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PumpFeesFees {
+    pub lp_fee_bps: u64,
+    pub protocol_fee_bps: u64,
+    pub creator_fee_bps: u64,
+}
+
+/// IDL `FeeTier`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PumpFeesFeeTier {
+    pub market_cap_lamports_threshold: u128,
+    pub fees: PumpFeesFees,
+}
+
+/// IDL `CreateFeeSharingConfigEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesCreateFeeSharingConfigEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub bonding_curve: Pubkey,
+    pub pool: Option<Pubkey>,
+    pub sharing_config: Pubkey,
+    pub admin: Pubkey,
+    pub initial_shareholders: Vec<PumpFeesShareholder>,
+    pub status: PumpFeesConfigStatus,
+}
+
+/// IDL `InitializeFeeConfigEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesInitializeFeeConfigEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub admin: Pubkey,
+    pub fee_config: Pubkey,
+}
+
+/// IDL `ResetFeeSharingConfigEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesResetFeeSharingConfigEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub sharing_config: Pubkey,
+    pub old_admin: Pubkey,
+    pub old_shareholders: Vec<PumpFeesShareholder>,
+    pub new_admin: Pubkey,
+    pub new_shareholders: Vec<PumpFeesShareholder>,
+}
+
+/// IDL `RevokeFeeSharingAuthorityEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesRevokeFeeSharingAuthorityEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub sharing_config: Pubkey,
+    pub admin: Pubkey,
+}
+
+/// IDL `TransferFeeSharingAuthorityEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesTransferFeeSharingAuthorityEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub sharing_config: Pubkey,
+    pub old_admin: Pubkey,
+    pub new_admin: Pubkey,
+}
+
+/// IDL `UpdateAdminEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesUpdateAdminEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub old_admin: Pubkey,
+    pub new_admin: Pubkey,
+}
+
+/// IDL `UpdateFeeConfigEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesUpdateFeeConfigEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub admin: Pubkey,
+    pub fee_config: Pubkey,
+    pub fee_tiers: Vec<PumpFeesFeeTier>,
+    pub flat_fees: PumpFeesFees,
+}
+
+/// IDL `UpdateFeeSharesEvent`
+///
+/// 链上 **`update_fee_shares` / `update_fee_shares_v2` 指令**还会在账户列表中带上
+/// `bonding_curve`、`pump_creator_vault`（Explorer #7/#8，`Program data` 日志体不含这两字段 ⇒ 仍为 `default`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesUpdateFeeSharesEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub sharing_config: Pubkey,
+    pub admin: Pubkey,
+    /// IDL：`bonding_curve`（ix 账户约 #7；Explorer `#7`）。
+    #[serde(default)]
+    pub bonding_curve: Pubkey,
+    /// **`pump_creator_vault`**：`creator-vault` PDA(seed 含 sharing_config)，ix 账户约 #8（Explorer `#8`）。
+    #[serde(default)]
+    pub pump_creator_vault: Pubkey,
+    pub new_shareholders: Vec<PumpFeesShareholder>,
+}
+
+/// IDL `UpsertFeeTiersEvent`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFeesUpsertFeeTiersEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub admin: Pubkey,
+    pub fee_config: Pubkey,
+    pub fee_tiers: Vec<PumpFeesFeeTier>,
+    pub offset: u8,
+}
+
+/// Pump.fun：曲线 creator 迁移（与费分成 onboarding 同框常见）
+///
+/// **`new_creator` 常为后续 `tradeEvent.creator`、`creator_vault` PDA 种子。**
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunMigrateBondingCurveCreatorEvent {
+    pub metadata: EventMetadata,
+    pub timestamp: i64,
+    pub mint: Pubkey,
+    pub bonding_curve: Pubkey,
+    pub sharing_config: Pubkey,
+    pub old_creator: Pubkey,
+    pub new_creator: Pubkey,
+}
+
 /// PumpFun Create Token Event - Based on IDL CreateEvent definition
 #[derive(Debug, Clone, Serialize, Deserialize, Default, BorshDeserialize)]
 pub struct PumpFunCreateTokenEvent {
@@ -201,6 +454,47 @@ pub struct PumpFunCreateTokenEvent {
     pub is_mayhem_mode: bool,
     /// Cashback 是否开启 (IDL CreateEvent.is_cashback_enabled)
     pub is_cashback_enabled: bool,
+    /// Quote mint for v2 quote pools (for example USDC).
+    pub quote_mint: Pubkey,
+    /// Quote-side vault account appended by PumpFun `create_v2` quote pools.
+    #[borsh(skip)]
+    pub quote_vault: Pubkey,
+    /// Quote-side token program appended by PumpFun `create_v2` quote pools.
+    #[borsh(skip)]
+    pub quote_token_program: Pubkey,
+    /// Initial virtual quote reserves. For SOL pools this is the SOL-side reserve;
+    /// for USDC pools this is the USDC-side reserve.
+    pub virtual_quote_reserves: u64,
+    /// Original PumpFun instruction name: `"create"` or `"create_v2"`.
+    #[borsh(skip)]
+    pub ix_name: String,
+    #[borsh(skip)]
+    pub mint_authority: Pubkey,
+    #[borsh(skip)]
+    pub associated_bonding_curve: Pubkey,
+    #[borsh(skip)]
+    pub global: Pubkey,
+    #[borsh(skip)]
+    pub system_program: Pubkey,
+    #[borsh(skip)]
+    pub associated_token_program: Pubkey,
+    #[borsh(skip)]
+    pub mayhem_program_id: Pubkey,
+    #[borsh(skip)]
+    pub global_params: Pubkey,
+    #[borsh(skip)]
+    pub sol_vault: Pubkey,
+    #[borsh(skip)]
+    pub mayhem_state: Pubkey,
+    #[borsh(skip)]
+    pub mayhem_token_vault: Pubkey,
+    #[borsh(skip)]
+    pub event_authority: Pubkey,
+    #[borsh(skip)]
+    pub program: Pubkey,
+    /// Same-tx later Pump Buy fee recipient, filled by `pumpfun_fee_enrich`.
+    #[borsh(skip)]
+    pub observed_fee_recipient: Pubkey,
 }
 
 /// PumpFun Create V2 Token Event (SPL-22 / Mayhem Mode)
@@ -224,6 +518,17 @@ pub struct PumpFunCreateV2TokenEvent {
     pub token_program: Pubkey,
     pub is_mayhem_mode: bool,
     pub is_cashback_enabled: bool,
+    #[borsh(skip)]
+    pub quote_mint: Pubkey,
+    #[borsh(skip)]
+    pub quote_vault: Pubkey,
+    #[borsh(skip)]
+    pub quote_token_program: Pubkey,
+    #[borsh(skip)]
+    pub virtual_quote_reserves: u64,
+    /// Original PumpFun instruction name: `"create"` or `"create_v2"`.
+    #[borsh(skip)]
+    pub ix_name: String,
     #[borsh(skip)]
     pub mint_authority: Pubkey,
     #[borsh(skip)]
@@ -346,6 +651,12 @@ pub struct PumpSwapBuyEvent {
     pub base_token_program: Pubkey,
     #[borsh(skip)]
     pub quote_token_program: Pubkey,
+    #[borsh(skip)]
+    pub pool_v2: Pubkey,
+    #[borsh(skip)]
+    pub fee_recipient: Pubkey,
+    #[borsh(skip)]
+    pub fee_recipient_quote_token_account: Pubkey,
 }
 
 /// PumpSwap Sell Event
@@ -402,6 +713,12 @@ pub struct PumpSwapSellEvent {
     pub base_token_program: Pubkey,
     #[borsh(skip)]
     pub quote_token_program: Pubkey,
+    #[borsh(skip)]
+    pub pool_v2: Pubkey,
+    #[borsh(skip)]
+    pub fee_recipient: Pubkey,
+    #[borsh(skip)]
+    pub fee_recipient_quote_token_account: Pubkey,
 }
 
 /// PumpSwap Create Pool Event
@@ -428,8 +745,12 @@ pub struct PumpSwapCreatePoolEvent {
     pub user_base_token_account: Pubkey,
     pub user_quote_token_account: Pubkey,
     pub coin_creator: Pubkey,
-    /// IDL CreatePoolEvent 最后一列
+    /// IDL CreatePoolEvent last field.
     pub is_mayhem_mode: bool,
+    /// create_pool instruction arg and Pool account field. Log-only CreatePoolEvent payloads do
+    /// not carry this value, so log-only parses keep the default `false`.
+    #[serde(default)]
+    pub is_cashback_coin: bool,
 }
 
 /// PumpSwap Pool Created Event - 指令解析版本
@@ -448,7 +769,7 @@ pub struct PumpSwapPoolCreated {
     pub initial_token_b_amount: u64,
 }
 
-/// PumpSwap Trade Event - 指令解析版本
+// PumpSwap Trade Event - 指令解析版本
 // #[derive(Debug, Clone, Serialize, Deserialize)]
 // pub struct PumpSwapTrade {
 //     pub metadata: EventMetadata,
@@ -635,40 +956,25 @@ pub struct RaydiumCpmmWithdrawEvent {
     pub user: Pubkey,
 }
 
-/// Raydium CLMM Swap Event (基于IDL SwapEvent + swap指令定义)
+/// Raydium CLMM Swap Event (IDL `SwapEvent`)
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmSwapEvent {
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
 
-    // === IDL SwapEvent 事件字段 (Borsh 序列化字段) ===
     pub pool_state: Pubkey,
+    pub sender: Pubkey,
     pub token_account_0: Pubkey,
     pub token_account_1: Pubkey,
     pub amount_0: u64,
+    pub transfer_fee_0: u64,
     pub amount_1: u64,
+    pub transfer_fee_1: u64,
     pub zero_for_one: bool,
     pub sqrt_price_x64: u128,
     pub liquidity: u128,
-
-    // === 非 Borsh 字段 ===
-    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
-    pub sender: Pubkey,
-    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
-    pub transfer_fee_0: u64,
-    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
-    pub transfer_fee_1: u64,
-    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub tick: i32,
-    // === 指令参数字段 (暂时注释，以后可能会用到，AI不要删除) ===
-    // pub amount: u64,
-    // pub other_amount_threshold: u64,
-    // pub sqrt_price_limit_x64: u128,
-    // pub is_base_input: bool,
-
-    // === 指令账户字段 (暂时注释，以后可能会用到，AI不要删除) ===
-    // TODO: 根据Raydium CLMM swap指令IDL添加账户字段
 }
 
 /// Raydium CLMM Close Position Event
@@ -680,78 +986,228 @@ pub struct RaydiumClmmClosePositionEvent {
     pub position_nft_mint: Pubkey,
 }
 
-/// Raydium CLMM Decrease Liquidity Event
+/// Raydium CLMM Decrease Liquidity Event (IDL `DecreaseLiquidityEvent`)
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmDecreaseLiquidityEvent {
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
 
-    // === Borsh 序列化字段 ===
-    pub pool: Pubkey,
     pub position_nft_mint: Pubkey,
-    pub amount0_min: u64,
-    pub amount1_min: u64,
     pub liquidity: u128,
+    pub decrease_amount_0: u64,
+    pub decrease_amount_1: u64,
+    pub fee_amount_0: u64,
+    pub fee_amount_1: u64,
+    pub reward_amounts: [u64; 3],
+    pub transfer_fee_0: u64,
+    pub transfer_fee_1: u64,
 
-    // === 非 Borsh 字段 ===
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub pool: Pubkey,
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub amount0_min: u64,
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub amount1_min: u64,
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub user: Pubkey,
 }
 
 /// Raydium CLMM Collect Fee Event
-#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+///
+/// Raydium emits separate `CollectPersonalFeeEvent` and
+/// `CollectProtocolFeeEvent` layouts. They are normalized into this single SDK
+/// event, so this struct intentionally does not derive `BorshDeserialize`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmCollectFeeEvent {
-    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
-
-    // === Borsh 序列化字段 ===
     pub pool_state: Pubkey,
     pub position_nft_mint: Pubkey,
+    pub recipient_token_account_0: Pubkey,
+    pub recipient_token_account_1: Pubkey,
     pub amount_0: u64,
     pub amount_1: u64,
 }
 
-/// Raydium CLMM Create Pool Event
+/// Raydium CLMM Create Pool Event (IDL `PoolCreatedEvent`)
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmCreatePoolEvent {
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
 
-    // === Borsh 序列化字段（从 inner instruction 事件）===
-    pub pool: Pubkey,
     pub token_0_mint: Pubkey,
     pub token_1_mint: Pubkey,
     pub tick_spacing: u16,
-    pub fee_rate: u32,
+    pub pool: Pubkey,
     pub sqrt_price_x64: u128,
+    pub tick: i32,
+    pub token_vault_0: Pubkey,
+    pub token_vault_1: Pubkey,
 
-    // === 非 Borsh 字段（从指令或账户） ===
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub fee_rate: u32,
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub creator: Pubkey,
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub open_time: u64,
 }
 
-/// Raydium CLMM Increase Liquidity Event
+/// Raydium CLMM Increase Liquidity Event (IDL `IncreaseLiquidityEvent`)
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmIncreaseLiquidityEvent {
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub metadata: EventMetadata,
 
-    // === Borsh 序列化字段 ===
-    pub pool: Pubkey,
     pub position_nft_mint: Pubkey,
-    pub amount0_max: u64,
-    pub amount1_max: u64,
     pub liquidity: u128,
+    pub amount_0: u64,
+    pub amount_1: u64,
+    pub amount_0_transfer_fee: u64,
+    pub amount_1_transfer_fee: u64,
 
-    // === 非 Borsh 字段 ===
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub pool: Pubkey,
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub amount0_max: u64,
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub amount1_max: u64,
     #[cfg_attr(feature = "parse-borsh", borsh(skip))]
     pub user: Pubkey,
+}
+
+/// Raydium CLMM Liquidity Change Event (IDL `LiquidityChangeEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmLiquidityChangeEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_state: Pubkey,
+    pub tick: i32,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub liquidity_before: u128,
+    pub liquidity_after: u128,
+}
+
+/// Raydium CLMM Config Change Event (IDL `ConfigChangeEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmConfigChangeEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub index: u16,
+    pub owner: Pubkey,
+    pub protocol_fee_rate: u32,
+    pub trade_fee_rate: u32,
+    pub tick_spacing: u16,
+    pub fund_fee_rate: u32,
+    pub fund_owner: Pubkey,
+}
+
+/// Raydium CLMM Create Personal Position Event (IDL `CreatePersonalPositionEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmCreatePersonalPositionEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_state: Pubkey,
+    pub minter: Pubkey,
+    pub nft_owner: Pubkey,
+    pub tick_lower_index: i32,
+    pub tick_upper_index: i32,
+    pub liquidity: u128,
+    pub deposit_amount_0: u64,
+    pub deposit_amount_1: u64,
+    pub deposit_amount_0_transfer_fee: u64,
+    pub deposit_amount_1_transfer_fee: u64,
+}
+
+/// Raydium CLMM Liquidity Calculate Event (IDL `LiquidityCalculateEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmLiquidityCalculateEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_liquidity: u128,
+    pub pool_sqrt_price_x64: u128,
+    pub pool_tick: i32,
+    pub calc_amount_0: u64,
+    pub calc_amount_1: u64,
+    pub trade_fee_owed_0: u64,
+    pub trade_fee_owed_1: u64,
+    pub transfer_fee_0: u64,
+    pub transfer_fee_1: u64,
+}
+
+/// Raydium CLMM Open Limit Order Event (IDL `OpenLimitOrderEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmOpenLimitOrderEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_id: Pubkey,
+    pub limit_order: Pubkey,
+    pub zero_for_one: bool,
+    pub tick_index: i32,
+    pub total_amount: u64,
+    pub transfer_fee: u64,
+}
+
+/// Raydium CLMM Increase Limit Order Event (IDL `IncreaseLimitOrderEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmIncreaseLimitOrderEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_id: Pubkey,
+    pub limit_order: Pubkey,
+    pub zero_for_one: bool,
+    pub tick_index: i32,
+    pub total_amount: u64,
+    pub increased_amount: u64,
+    pub transfer_fee: u64,
+}
+
+/// Raydium CLMM Decrease Limit Order Event (IDL `DecreaseLimitOrderEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmDecreaseLimitOrderEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_id: Pubkey,
+    pub limit_order: Pubkey,
+    pub zero_for_one: bool,
+    pub tick_index: i32,
+    pub total_amount: u64,
+    pub filled_amount: u64,
+    pub settled_output_amount: u64,
+    pub decreased_amount: u64,
+}
+
+/// Raydium CLMM Settle Limit Order Event (IDL `SettleLimitOrderEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmSettleLimitOrderEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub pool_id: Pubkey,
+    pub limit_order: Pubkey,
+    pub zero_for_one: bool,
+    pub tick_index: i32,
+    pub total_amount: u64,
+    pub filled_amount: u64,
+    pub settled_amount_out: u64,
+}
+
+/// Raydium CLMM Update Reward Infos Event (IDL `UpdateRewardInfosEvent`)
+#[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmUpdateRewardInfosEvent {
+    #[cfg_attr(feature = "parse-borsh", borsh(skip))]
+    pub metadata: EventMetadata,
+    pub reward_growth_global_x64: [u128; 3],
 }
 
 /// Raydium CLMM Open Position with Token Extension NFT Event
@@ -1027,14 +1483,14 @@ pub struct RaydiumAmmV4WithdrawPnlEvent {
 
 // ====================== Account Events ======================
 
-/// Bonk (Raydium Launchpad) AmmCreatorFeeOn enum
+/// RaydiumLaunchlab (Raydium LaunchLab) AmmCreatorFeeOn enum
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AmmCreatorFeeOn {
     QuoteToken = 0,
     BothToken = 1,
 }
 
-/// Bonk (Raydium Launchpad) VestingSchedule
+/// RaydiumLaunchlab (Raydium LaunchLab) VestingSchedule
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VestingSchedule {
     pub total_locked_amount: u64,
@@ -1042,16 +1498,16 @@ pub struct VestingSchedule {
     pub unlock_period: u64,
 }
 
-/// Bonk Pool State Account Event
+/// RaydiumLaunchlab Pool State Account Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkPoolStateAccountEvent {
+pub struct RaydiumLaunchlabPoolStateAccountEvent {
     pub metadata: EventMetadata,
     pub pubkey: Pubkey,
-    pub pool_state: BonkPoolState,
+    pub pool_state: RaydiumLaunchlabPoolState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkPoolState {
+pub struct RaydiumLaunchlabPoolState {
     pub epoch: u64,
     pub auth_bump: u8,
     pub status: u8,
@@ -1083,30 +1539,30 @@ pub struct BonkPoolState {
     pub padding: [u8; 54],
 }
 
-/// Bonk Global Config Account Event
+/// RaydiumLaunchlab Global Config Account Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkGlobalConfigAccountEvent {
+pub struct RaydiumLaunchlabGlobalConfigAccountEvent {
     pub metadata: EventMetadata,
     pub pubkey: Pubkey,
-    pub global_config: BonkGlobalConfig,
+    pub global_config: RaydiumLaunchlabGlobalConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkGlobalConfig {
+pub struct RaydiumLaunchlabGlobalConfig {
     pub protocol_fee_rate: u64,
     pub trade_fee_rate: u64,
     pub migration_fee_rate: u64,
 }
 
-/// Bonk Platform Config Account Event
+/// RaydiumLaunchlab Platform Config Account Event
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkPlatformConfigAccountEvent {
+pub struct RaydiumLaunchlabPlatformConfigAccountEvent {
     pub metadata: EventMetadata,
     pub pubkey: Pubkey,
-    pub platform_config: BonkPlatformConfig,
+    pub platform_config: RaydiumLaunchlabPlatformConfig,
 }
 
-/// Bonk (Raydium Launchpad) BondingCurveParam
+/// RaydiumLaunchlab (Raydium LaunchLab) BondingCurveParam
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BondingCurveParam {
     pub migrate_type: u8,
@@ -1119,7 +1575,7 @@ pub struct BondingCurveParam {
     pub unlock_period: u64,
 }
 
-/// Bonk (Raydium Launchpad) PlatformCurveParam
+/// RaydiumLaunchlab (Raydium LaunchLab) PlatformCurveParam
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformCurveParam {
     pub epoch: u64,
@@ -1131,7 +1587,7 @@ pub struct PlatformCurveParam {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BonkPlatformConfig {
+pub struct RaydiumLaunchlabPlatformConfig {
     pub epoch: u64,
     pub platform_fee_wallet: Pubkey,
     pub platform_nft_wallet: Pubkey,
@@ -1222,14 +1678,88 @@ pub struct PumpFunBondingCurveAccountEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PumpFunBondingCurve {
     pub virtual_token_reserves: u64,
-    pub virtual_sol_reserves: u64,
+    pub virtual_quote_reserves: u64,
     pub real_token_reserves: u64,
-    pub real_sol_reserves: u64,
+    pub real_quote_reserves: u64,
     pub token_total_supply: u64,
     pub complete: bool,
-    /// Cashback 币种标记 (PUMP_CASHBACK_README)
-    #[serde(default)]
+    pub creator: Pubkey,
+    pub is_mayhem_mode: bool,
     pub is_cashback_coin: bool,
+    pub quote_mint: Pubkey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunFeeConfigAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub fee_config: PumpFunFeeConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunFeeConfig {
+    pub bump: u8,
+    pub admin: Pubkey,
+    pub flat_fees: PumpFeesFees,
+    pub fee_tiers: Vec<PumpFeesFeeTier>,
+    pub stable_fee_tiers: Vec<PumpFeesFeeTier>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunSharingConfigAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub sharing_config: PumpFunSharingConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunSharingConfig {
+    pub bump: u8,
+    pub version: u8,
+    pub status: PumpFeesConfigStatus,
+    pub mint: Pubkey,
+    pub admin: Pubkey,
+    pub admin_revoked: bool,
+    pub shareholders: Vec<PumpFeesShareholder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunGlobalVolumeAccumulatorAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub global_volume_accumulator: PumpFunGlobalVolumeAccumulator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunGlobalVolumeAccumulator {
+    pub start_time: i64,
+    pub end_time: i64,
+    pub seconds_in_a_day: i64,
+    pub mint: Pubkey,
+    pub total_token_supply: [u64; 30],
+    pub sol_volumes: [u64; 30],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunUserVolumeAccumulatorAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub user_volume_accumulator: PumpFunUserVolumeAccumulator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PumpFunUserVolumeAccumulator {
+    pub user: Pubkey,
+    pub needs_claim: bool,
+    pub total_unclaimed_tokens: u64,
+    pub total_claimed_tokens: u64,
+    pub current_sol_volume: u64,
+    pub last_update_timestamp: i64,
+    pub has_total_claimed_tokens: bool,
+    pub cashback_earned: u64,
+    pub total_cashback_claimed: u64,
+    pub stable_cashback_earned: u64,
+    pub total_stable_cashback_claimed: u64,
 }
 
 /// PumpFun Global Account Event
@@ -1254,7 +1784,7 @@ pub struct PumpFunGlobal {
     pub enable_migrate: bool,
     pub pool_migration_fee: u64,
     pub creator_fee_basis_points: u64,
-    pub fee_recipients: [Pubkey; 8],
+    pub fee_recipients: [Pubkey; 7],
     pub set_creator_authority: Pubkey,
     pub admin_set_creator_authority: Pubkey,
     pub create_v2_enabled: bool,
@@ -1262,6 +1792,11 @@ pub struct PumpFunGlobal {
     pub reserved_fee_recipient: Pubkey,
     pub mayhem_mode_enabled: bool,
     pub reserved_fee_recipients: [Pubkey; 7],
+    pub is_cashback_enabled: bool,
+    pub buyback_fee_recipients: [Pubkey; 8],
+    pub buyback_basis_points: u64,
+    pub initial_virtual_quote_reserves: u64,
+    pub whitelisted_quote_mints: [Pubkey; 1],
 }
 
 /// Raydium AMM V4 Info Account Event
@@ -1309,7 +1844,9 @@ pub struct RaydiumClmmAmmConfig {
     pub trade_fee_rate: u32,
     pub tick_spacing: u16,
     pub fund_fee_rate: u32,
+    pub padding_u32: u32,
     pub fund_owner: Pubkey,
+    pub padding: [u64; 3],
 }
 
 /// Raydium CLMM Pool State Account Event
@@ -1325,17 +1862,67 @@ pub struct RaydiumClmmPoolState {
     pub bump: [u8; 1],
     pub amm_config: Pubkey,
     pub owner: Pubkey,
-    pub token_mint0: Pubkey,
-    pub token_mint1: Pubkey,
-    pub token_vault0: Pubkey,
-    pub token_vault1: Pubkey,
+    pub token_mint_0: Pubkey,
+    pub token_mint_1: Pubkey,
+    pub token_vault_0: Pubkey,
+    pub token_vault_1: Pubkey,
     pub observation_key: Pubkey,
-    pub mint_decimals0: u8,
-    pub mint_decimals1: u8,
+    pub mint_decimals_0: u8,
+    pub mint_decimals_1: u8,
     pub tick_spacing: u16,
     pub liquidity: u128,
     pub sqrt_price_x64: u128,
     pub tick_current: i32,
+    pub padding3: u16,
+    pub padding4: u16,
+    pub fee_growth_global_0_x64: u128,
+    pub fee_growth_global_1_x64: u128,
+    pub protocol_fees_token_0: u64,
+    pub protocol_fees_token_1: u64,
+    pub padding5: [u128; 4],
+    pub status: u8,
+    pub fee_on: u8,
+    pub padding: [u8; 6],
+    pub reward_infos: [RaydiumClmmRewardInfo; 3],
+    pub tick_array_bitmap: [u64; 16],
+    pub padding6: [u64; 4],
+    pub fund_fees_token_0: u64,
+    pub fund_fees_token_1: u64,
+    pub open_time: u64,
+    pub recent_epoch: u64,
+    pub dynamic_fee_info: RaydiumClmmDynamicFeeInfo,
+    pub padding1: [u64; 14],
+    pub padding2: [u64; 32],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmRewardInfo {
+    pub reward_state: u8,
+    pub open_time: u64,
+    pub end_time: u64,
+    pub last_update_time: u64,
+    pub emissions_per_second_x64: u128,
+    pub reward_total_emitted: u64,
+    pub reward_claimed: u64,
+    pub token_mint: Pubkey,
+    pub token_vault: Pubkey,
+    pub authority: Pubkey,
+    pub reward_growth_global_x64: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RaydiumClmmDynamicFeeInfo {
+    pub filter_period: u16,
+    pub decay_period: u16,
+    pub reduction_factor: u16,
+    pub dynamic_fee_control: u32,
+    pub max_volatility_accumulator: u32,
+    pub tick_spacing_index_reference: i32,
+    pub volatility_reference: u32,
+    pub volatility_accumulator: u32,
+    pub last_update_timestamp: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub padding: [u8; 46],
 }
 
 /// Raydium CLMM Tick Array State Account Event
@@ -1348,11 +1935,13 @@ pub struct RaydiumClmmTickArrayStateAccountEvent {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RaydiumClmmTickArrayState {
-    pub discriminator: u64,
     pub pool_id: Pubkey,
     pub start_tick_index: i32,
     pub ticks: Vec<Tick>,
     pub initialized_tick_count: u8,
+    pub recent_epoch: u64,
+    #[serde(with = "serde_big_array::BigArray")]
+    pub padding: [u8; 107],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1363,6 +1952,11 @@ pub struct Tick {
     pub fee_growth_outside_0_x64: u128,
     pub fee_growth_outside_1_x64: u128,
     pub reward_growths_outside_x64: [u128; 3],
+    pub order_phase: u64,
+    pub orders_amount: u64,
+    pub part_filled_orders_remaining: u64,
+    pub unfilled_ratio_x64: u128,
+    pub padding: [u32; 3],
 }
 
 /// Raydium CPMM AMM Config Account Event
@@ -1426,6 +2020,127 @@ pub struct RaydiumCpmmPoolState {
     pub creator_fees_token_0: u64,
     pub creator_fees_token_1: u64,
     pub padding: [u64; 28],
+}
+
+// ====================== Orca Whirlpool Account Events ======================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWhirlpoolAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub whirlpool: OrcaWhirlpoolAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWhirlpoolAccount {
+    pub whirlpools_config: Pubkey,
+    pub whirlpool_bump: u8,
+    pub tick_spacing: u16,
+    pub tick_spacing_seed: [u8; 2],
+    pub fee_rate: u16,
+    pub protocol_fee_rate: u16,
+    pub liquidity: u128,
+    pub sqrt_price: u128,
+    pub tick_current_index: i32,
+    pub protocol_fee_owed_a: u64,
+    pub protocol_fee_owed_b: u64,
+    pub token_mint_a: Pubkey,
+    pub token_vault_a: Pubkey,
+    pub fee_growth_global_a: u128,
+    pub token_mint_b: Pubkey,
+    pub token_vault_b: Pubkey,
+    pub fee_growth_global_b: u128,
+    pub reward_last_updated_timestamp: u64,
+    pub reward_infos: [OrcaWhirlpoolRewardInfo; 3],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OrcaWhirlpoolRewardInfo {
+    pub mint: Pubkey,
+    pub vault: Pubkey,
+    pub authority: Pubkey,
+    pub emissions_per_second_x64: u128,
+    pub growth_global_x64: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaPositionAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub position: OrcaPositionAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaPositionAccount {
+    pub whirlpool: Pubkey,
+    pub position_mint: Pubkey,
+    pub liquidity: u128,
+    pub tick_lower_index: i32,
+    pub tick_upper_index: i32,
+    pub fee_growth_checkpoint_a: u128,
+    pub fee_owed_a: u64,
+    pub fee_growth_checkpoint_b: u128,
+    pub fee_owed_b: u64,
+    pub reward_infos: [OrcaPositionRewardInfo; 3],
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OrcaPositionRewardInfo {
+    pub growth_inside_checkpoint: u128,
+    pub amount_owed: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaTickArrayAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub tick_array: OrcaTickArrayAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaTickArrayAccount {
+    pub start_tick_index: i32,
+    pub ticks: Vec<OrcaTick>,
+    pub whirlpool: Pubkey,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaTick {
+    pub initialized: bool,
+    pub liquidity_net: i128,
+    pub liquidity_gross: u128,
+    pub fee_growth_outside_a: u128,
+    pub fee_growth_outside_b: u128,
+    pub reward_growths_outside: [u128; 3],
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaFeeTierAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub fee_tier: OrcaFeeTierAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaFeeTierAccount {
+    pub whirlpools_config: Pubkey,
+    pub tick_spacing: u16,
+    pub default_fee_rate: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWhirlpoolsConfigAccountEvent {
+    pub metadata: EventMetadata,
+    pub pubkey: Pubkey,
+    pub config: OrcaWhirlpoolsConfigAccount,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrcaWhirlpoolsConfigAccount {
+    pub fee_authority: Pubkey,
+    pub collect_protocol_fees_authority: Pubkey,
+    pub reward_emissions_super_authority: Pubkey,
+    pub default_protocol_fee_rate: u16,
 }
 
 /// Token Info Event
@@ -1745,6 +2460,34 @@ pub struct MeteoraDammV2RemoveLiquidityEvent {
     pub token_b_amount_threshold: u64,
 }
 
+/// Meteora DAMM V2 Initialize Pool Event
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MeteoraDammV2InitializePoolEvent {
+    pub metadata: EventMetadata,
+    pub pool: Pubkey,
+    pub token_a_mint: Pubkey,
+    pub token_b_mint: Pubkey,
+    pub creator: Pubkey,
+    pub payer: Pubkey,
+    pub position: Pubkey,
+    pub position_nft_mint: Pubkey,
+    pub alpha_vault: Pubkey,
+    pub sqrt_min_price: u128,
+    pub sqrt_max_price: u128,
+    pub activation_type: u8,
+    pub collect_fee_mode: u8,
+    pub liquidity: u128,
+    pub sqrt_price: u128,
+    pub activation_point: Option<u64>,
+    pub token_a_flag: u8,
+    pub token_b_flag: u8,
+    pub token_a_amount: u64,
+    pub token_b_amount: u64,
+    pub total_amount_a: u64,
+    pub total_amount_b: u64,
+    pub pool_type: u8,
+}
+
 /// Meteora DAMM V2 Create Position Event
 #[cfg_attr(feature = "parse-borsh", derive(BorshDeserialize))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1771,6 +2514,49 @@ pub struct MeteoraDammV2ClosePositionEvent {
     pub owner: Pubkey,             // 32 bytes
     pub position: Pubkey,          // 32 bytes
     pub position_nft_mint: Pubkey, // 32 bytes
+}
+
+// ====================== Meteora DBC Events ======================
+
+/// Meteora DBC Swap Event (IDL `EvtSwap`)
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MeteoraDbcSwapEvent {
+    pub metadata: EventMetadata,
+    pub pool: Pubkey,
+    pub config: Pubkey,
+    pub trade_direction: u8,
+    pub has_referral: bool,
+    pub amount_in: u64,
+    pub minimum_amount_out: u64,
+    pub actual_input_amount: u64,
+    pub output_amount: u64,
+    pub next_sqrt_price: u128,
+    pub trading_fee: u64,
+    pub protocol_fee: u64,
+    pub referral_fee: u64,
+    pub current_timestamp: u64,
+}
+
+/// Meteora DBC Initialize Pool Event (IDL `EvtInitializePool`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeteoraDbcInitializePoolEvent {
+    pub metadata: EventMetadata,
+    pub pool: Pubkey,
+    pub config: Pubkey,
+    pub creator: Pubkey,
+    pub base_mint: Pubkey,
+    pub pool_type: u8,
+    pub activation_point: u64,
+}
+
+/// Meteora DBC Curve Complete Event (IDL `EvtCurveComplete`)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeteoraDbcCurveCompleteEvent {
+    pub metadata: EventMetadata,
+    pub pool: Pubkey,
+    pub config: Pubkey,
+    pub base_reserve: u64,
+    pub quote_reserve: u64,
 }
 
 /// Meteora DLMM Swap Event
@@ -1892,275 +2678,4 @@ pub struct MeteoraDlmmClaimFeeEvent {
     pub owner: Pubkey,    // 32 bytes
     pub fee_x: u64,       // 8 bytes
     pub fee_y: u64,       // 8 bytes
-}
-
-// ====================== 统一的 DEX 事件枚举 ======================
-
-/// 统一的 DEX 事件枚举 - 参考 sol-dex-shreds 的做法
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DexEvent {
-    // PumpFun 事件
-    PumpFunCreate(PumpFunCreateTokenEvent),     // - 已对接
-    PumpFunCreateV2(PumpFunCreateV2TokenEvent), // - 已对接 (CreateV2 / Mayhem)
-    PumpFunTrade(PumpFunTradeEvent),            // - 已对接 (统一交易事件，包含所有交易类型)
-    PumpFunBuy(PumpFunTradeEvent),              // - 已对接 (仅买入事件，用于过滤)
-    PumpFunSell(PumpFunTradeEvent),             // - 已对接 (仅卖出事件，用于过滤)
-    PumpFunBuyExactSolIn(PumpFunTradeEvent),    // - 已对接 (精确SOL买入事件，用于过滤)
-    PumpFunMigrate(PumpFunMigrateEvent),        // - 已对接
-
-    // PumpSwap 事件
-    PumpSwapTrade(PumpSwapTradeEvent), // - 已对接 (buy/sell/buy_exact_sol_in)
-    PumpSwapBuy(PumpSwapBuyEvent),     // - 已对接 (legacy)
-    PumpSwapSell(PumpSwapSellEvent),   // - 已对接 (legacy)
-    PumpSwapCreatePool(PumpSwapCreatePoolEvent), // - 已对接
-    PumpSwapLiquidityAdded(PumpSwapLiquidityAdded), // - 已对接
-    PumpSwapLiquidityRemoved(PumpSwapLiquidityRemoved), // - 已对接
-
-    // Meteora DAMM V2 事件
-    MeteoraDammV2Swap(MeteoraDammV2SwapEvent), // - 已对接
-    MeteoraDammV2CreatePosition(MeteoraDammV2CreatePositionEvent), // - 已对接
-    MeteoraDammV2ClosePosition(MeteoraDammV2ClosePositionEvent), // - 已对接
-    MeteoraDammV2AddLiquidity(MeteoraDammV2AddLiquidityEvent), // - 已对接
-    MeteoraDammV2RemoveLiquidity(MeteoraDammV2RemoveLiquidityEvent), // - 已对接
-
-    // Bonk 事件
-    BonkTrade(BonkTradeEvent),
-    BonkPoolCreate(BonkPoolCreateEvent),
-    BonkMigrateAmm(BonkMigrateAmmEvent),
-
-    // Raydium CLMM 事件
-    RaydiumClmmSwap(RaydiumClmmSwapEvent),
-    RaydiumClmmCreatePool(RaydiumClmmCreatePoolEvent),
-    RaydiumClmmOpenPosition(RaydiumClmmOpenPositionEvent),
-    RaydiumClmmOpenPositionWithTokenExtNft(RaydiumClmmOpenPositionWithTokenExtNftEvent),
-    RaydiumClmmClosePosition(RaydiumClmmClosePositionEvent),
-    RaydiumClmmIncreaseLiquidity(RaydiumClmmIncreaseLiquidityEvent),
-    RaydiumClmmDecreaseLiquidity(RaydiumClmmDecreaseLiquidityEvent),
-    RaydiumClmmCollectFee(RaydiumClmmCollectFeeEvent),
-
-    // Raydium CPMM 事件
-    RaydiumCpmmSwap(RaydiumCpmmSwapEvent),
-    RaydiumCpmmDeposit(RaydiumCpmmDepositEvent),
-    RaydiumCpmmWithdraw(RaydiumCpmmWithdrawEvent),
-    RaydiumCpmmInitialize(RaydiumCpmmInitializeEvent),
-
-    // Raydium AMM V4 事件
-    RaydiumAmmV4Swap(RaydiumAmmV4SwapEvent),
-    RaydiumAmmV4Deposit(RaydiumAmmV4DepositEvent),
-    RaydiumAmmV4Initialize2(RaydiumAmmV4Initialize2Event),
-    RaydiumAmmV4Withdraw(RaydiumAmmV4WithdrawEvent),
-    RaydiumAmmV4WithdrawPnl(RaydiumAmmV4WithdrawPnlEvent),
-
-    // Orca Whirlpool 事件
-    OrcaWhirlpoolSwap(OrcaWhirlpoolSwapEvent),
-    OrcaWhirlpoolLiquidityIncreased(OrcaWhirlpoolLiquidityIncreasedEvent),
-    OrcaWhirlpoolLiquidityDecreased(OrcaWhirlpoolLiquidityDecreasedEvent),
-    OrcaWhirlpoolPoolInitialized(OrcaWhirlpoolPoolInitializedEvent),
-
-    // Meteora Pools 事件
-    MeteoraPoolsSwap(MeteoraPoolsSwapEvent),
-    MeteoraPoolsAddLiquidity(MeteoraPoolsAddLiquidityEvent),
-    MeteoraPoolsRemoveLiquidity(MeteoraPoolsRemoveLiquidityEvent),
-    MeteoraPoolsBootstrapLiquidity(MeteoraPoolsBootstrapLiquidityEvent),
-    MeteoraPoolsPoolCreated(MeteoraPoolsPoolCreatedEvent),
-    MeteoraPoolsSetPoolFees(MeteoraPoolsSetPoolFeesEvent),
-
-    // Meteora DLMM 事件
-    MeteoraDlmmSwap(MeteoraDlmmSwapEvent),
-    MeteoraDlmmAddLiquidity(MeteoraDlmmAddLiquidityEvent),
-    MeteoraDlmmRemoveLiquidity(MeteoraDlmmRemoveLiquidityEvent),
-    MeteoraDlmmInitializePool(MeteoraDlmmInitializePoolEvent),
-    MeteoraDlmmInitializeBinArray(MeteoraDlmmInitializeBinArrayEvent),
-    MeteoraDlmmCreatePosition(MeteoraDlmmCreatePositionEvent),
-    MeteoraDlmmClosePosition(MeteoraDlmmClosePositionEvent),
-    MeteoraDlmmClaimFee(MeteoraDlmmClaimFeeEvent),
-
-    // 账户事件
-    TokenInfo(TokenInfoEvent),       // - 已对接
-    TokenAccount(TokenAccountEvent), // - 已对接
-    NonceAccount(NonceAccountEvent), // - 已对接
-    PumpSwapGlobalConfigAccount(PumpSwapGlobalConfigAccountEvent), // - 已对接
-    PumpSwapPoolAccount(PumpSwapPoolAccountEvent), // - 已对接
-
-    // 区块元数据事件
-    BlockMeta(BlockMetaEvent),
-
-    // 错误事件
-    Error(String),
-}
-
-// 静态默认 EventMetadata，用于 Error 事件
-use once_cell::sync::Lazy;
-static DEFAULT_METADATA: Lazy<EventMetadata> = Lazy::new(|| EventMetadata {
-    signature: Signature::from([0u8; 64]),
-    slot: 0,
-    tx_index: 0,
-    block_time_us: 0,
-    grpc_recv_us: 0,
-    recent_blockhash: None,
-});
-
-impl DexEvent {
-    /// 获取事件的元数据
-    pub fn metadata(&self) -> &EventMetadata {
-        match self {
-            // PumpFun 事件
-            DexEvent::PumpFunCreate(e) => &e.metadata,
-            DexEvent::PumpFunCreateV2(e) => &e.metadata,
-            DexEvent::PumpFunTrade(e) => &e.metadata,
-            DexEvent::PumpFunBuy(e) => &e.metadata,
-            DexEvent::PumpFunSell(e) => &e.metadata,
-            DexEvent::PumpFunBuyExactSolIn(e) => &e.metadata,
-            DexEvent::PumpFunMigrate(e) => &e.metadata,
-
-            // PumpSwap 事件
-            DexEvent::PumpSwapTrade(e) => &e.metadata,
-            DexEvent::PumpSwapBuy(e) => &e.metadata,
-            DexEvent::PumpSwapSell(e) => &e.metadata,
-            DexEvent::PumpSwapCreatePool(e) => &e.metadata,
-            DexEvent::PumpSwapLiquidityAdded(e) => &e.metadata,
-            DexEvent::PumpSwapLiquidityRemoved(e) => &e.metadata,
-
-            // Meteora DAMM V2 事件
-            DexEvent::MeteoraDammV2Swap(e) => &e.metadata,
-            DexEvent::MeteoraDammV2CreatePosition(e) => &e.metadata,
-            DexEvent::MeteoraDammV2ClosePosition(e) => &e.metadata,
-            DexEvent::MeteoraDammV2AddLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraDammV2RemoveLiquidity(e) => &e.metadata,
-
-            // Bonk 事件
-            DexEvent::BonkTrade(e) => &e.metadata,
-            DexEvent::BonkPoolCreate(e) => &e.metadata,
-            DexEvent::BonkMigrateAmm(e) => &e.metadata,
-
-            // Raydium CLMM 事件
-            DexEvent::RaydiumClmmSwap(e) => &e.metadata,
-            DexEvent::RaydiumClmmCreatePool(e) => &e.metadata,
-            DexEvent::RaydiumClmmOpenPosition(e) => &e.metadata,
-            DexEvent::RaydiumClmmOpenPositionWithTokenExtNft(e) => &e.metadata,
-            DexEvent::RaydiumClmmClosePosition(e) => &e.metadata,
-            DexEvent::RaydiumClmmIncreaseLiquidity(e) => &e.metadata,
-            DexEvent::RaydiumClmmDecreaseLiquidity(e) => &e.metadata,
-            DexEvent::RaydiumClmmCollectFee(e) => &e.metadata,
-
-            // Raydium CPMM 事件
-            DexEvent::RaydiumCpmmSwap(e) => &e.metadata,
-            DexEvent::RaydiumCpmmDeposit(e) => &e.metadata,
-            DexEvent::RaydiumCpmmWithdraw(e) => &e.metadata,
-            DexEvent::RaydiumCpmmInitialize(e) => &e.metadata,
-
-            // Raydium AMM V4 事件
-            DexEvent::RaydiumAmmV4Swap(e) => &e.metadata,
-            DexEvent::RaydiumAmmV4Deposit(e) => &e.metadata,
-            DexEvent::RaydiumAmmV4Initialize2(e) => &e.metadata,
-            DexEvent::RaydiumAmmV4Withdraw(e) => &e.metadata,
-            DexEvent::RaydiumAmmV4WithdrawPnl(e) => &e.metadata,
-
-            // Orca Whirlpool 事件
-            DexEvent::OrcaWhirlpoolSwap(e) => &e.metadata,
-            DexEvent::OrcaWhirlpoolLiquidityIncreased(e) => &e.metadata,
-            DexEvent::OrcaWhirlpoolLiquidityDecreased(e) => &e.metadata,
-            DexEvent::OrcaWhirlpoolPoolInitialized(e) => &e.metadata,
-
-            // Meteora Pools 事件
-            DexEvent::MeteoraPoolsSwap(e) => &e.metadata,
-            DexEvent::MeteoraPoolsAddLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraPoolsRemoveLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraPoolsBootstrapLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraPoolsPoolCreated(e) => &e.metadata,
-            DexEvent::MeteoraPoolsSetPoolFees(e) => &e.metadata,
-
-            // Meteora DLMM 事件
-            DexEvent::MeteoraDlmmSwap(e) => &e.metadata,
-            DexEvent::MeteoraDlmmAddLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraDlmmRemoveLiquidity(e) => &e.metadata,
-            DexEvent::MeteoraDlmmInitializePool(e) => &e.metadata,
-            DexEvent::MeteoraDlmmInitializeBinArray(e) => &e.metadata,
-            DexEvent::MeteoraDlmmCreatePosition(e) => &e.metadata,
-            DexEvent::MeteoraDlmmClosePosition(e) => &e.metadata,
-            DexEvent::MeteoraDlmmClaimFee(e) => &e.metadata,
-
-            // 账户事件
-            DexEvent::TokenInfo(e) => &e.metadata,
-            DexEvent::TokenAccount(e) => &e.metadata,
-            DexEvent::NonceAccount(e) => &e.metadata,
-            DexEvent::PumpSwapGlobalConfigAccount(e) => &e.metadata,
-            DexEvent::PumpSwapPoolAccount(e) => &e.metadata,
-
-            // 区块元数据事件
-            DexEvent::BlockMeta(e) => &e.metadata,
-
-            // 错误事件 - 返回默认元数据
-            DexEvent::Error(_) => &DEFAULT_METADATA,
-        }
-    }
-
-    /// Mutable metadata for filling shared fields (e.g. recent_blockhash). Returns None for Error variant.
-    pub fn metadata_mut(&mut self) -> Option<&mut EventMetadata> {
-        match self {
-            DexEvent::PumpFunCreate(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunCreateV2(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunTrade(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunBuy(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunSell(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunBuyExactSolIn(e) => Some(&mut e.metadata),
-            DexEvent::PumpFunMigrate(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapTrade(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapBuy(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapSell(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapCreatePool(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapLiquidityAdded(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapLiquidityRemoved(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDammV2Swap(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDammV2CreatePosition(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDammV2ClosePosition(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDammV2AddLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDammV2RemoveLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::BonkTrade(e) => Some(&mut e.metadata),
-            DexEvent::BonkPoolCreate(e) => Some(&mut e.metadata),
-            DexEvent::BonkMigrateAmm(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmSwap(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmCreatePool(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmOpenPosition(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmOpenPositionWithTokenExtNft(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmClosePosition(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmIncreaseLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmDecreaseLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumClmmCollectFee(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumCpmmSwap(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumCpmmDeposit(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumCpmmWithdraw(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumCpmmInitialize(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumAmmV4Swap(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumAmmV4Deposit(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumAmmV4Initialize2(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumAmmV4Withdraw(e) => Some(&mut e.metadata),
-            DexEvent::RaydiumAmmV4WithdrawPnl(e) => Some(&mut e.metadata),
-            DexEvent::OrcaWhirlpoolSwap(e) => Some(&mut e.metadata),
-            DexEvent::OrcaWhirlpoolLiquidityIncreased(e) => Some(&mut e.metadata),
-            DexEvent::OrcaWhirlpoolLiquidityDecreased(e) => Some(&mut e.metadata),
-            DexEvent::OrcaWhirlpoolPoolInitialized(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsSwap(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsAddLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsRemoveLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsBootstrapLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsPoolCreated(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraPoolsSetPoolFees(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmSwap(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmAddLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmRemoveLiquidity(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmInitializePool(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmInitializeBinArray(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmCreatePosition(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmClosePosition(e) => Some(&mut e.metadata),
-            DexEvent::MeteoraDlmmClaimFee(e) => Some(&mut e.metadata),
-            DexEvent::TokenInfo(e) => Some(&mut e.metadata),
-            DexEvent::TokenAccount(e) => Some(&mut e.metadata),
-            DexEvent::NonceAccount(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapGlobalConfigAccount(e) => Some(&mut e.metadata),
-            DexEvent::PumpSwapPoolAccount(e) => Some(&mut e.metadata),
-            DexEvent::BlockMeta(e) => Some(&mut e.metadata),
-            DexEvent::Error(_) => None,
-        }
-    }
 }

@@ -16,6 +16,7 @@ use solana_transaction_status::{
     EncodedConfirmedTransactionWithStatusMeta, EncodedTransaction, UiTransactionEncoding,
 };
 use std::collections::HashMap;
+use std::str::FromStr;
 use yellowstone_grpc_proto::prelude::{
     CompiledInstruction, InnerInstruction, InnerInstructions, Message, MessageAddressTableLookup,
     MessageHeader, Transaction, TransactionStatusMeta,
@@ -111,13 +112,10 @@ pub fn parse_rpc_transaction(
         }
     });
 
-    // Build program_invokes HashMap for account filling
-    // Use string keys to match gRPC parsing logic
-    let mut program_invokes: HashMap<&str, Vec<(i32, i32)>> = HashMap::new();
+    let mut program_invokes: HashMap<Pubkey, Vec<(i32, i32)>> = HashMap::new();
 
     if let Some(ref tx) = grpc_tx_opt {
         if let Some(ref msg) = tx.message {
-            // Build account key lookup
             let keys_len = msg.account_keys.len();
             let writable_len = grpc_meta.loaded_writable_addresses.len();
             let get_key = |i: usize| -> Option<&Vec<u8>> {
@@ -130,27 +128,18 @@ pub fn parse_rpc_transaction(
                 }
             };
 
-            // Record outer instructions
             for (i, ix) in msg.instructions.iter().enumerate() {
                 let pid = get_key(ix.program_id_index as usize)
                     .map_or(Pubkey::default(), |k| read_pubkey_fast(k));
-                let pid_str = pid.to_string();
-                let pid_static: &'static str = pid_str.leak();
-                program_invokes.entry(pid_static).or_default().push((i as i32, -1));
+                program_invokes.entry(pid).or_default().push((i as i32, -1));
             }
 
-            // Record inner instructions
             for inner in &grpc_meta.inner_instructions {
                 let outer_idx = inner.index as usize;
                 for (j, inner_ix) in inner.instructions.iter().enumerate() {
                     let pid = get_key(inner_ix.program_id_index as usize)
                         .map_or(Pubkey::default(), |k| read_pubkey_fast(k));
-                    let pid_str = pid.to_string();
-                    let pid_static: &'static str = pid_str.leak();
-                    program_invokes
-                        .entry(pid_static)
-                        .or_default()
-                        .push((outer_idx as i32, j as i32));
+                    program_invokes.entry(pid).or_default().push((outer_idx as i32, j as i32));
                 }
             }
         }
@@ -169,10 +158,20 @@ pub fn parse_rpc_transaction(
     );
 
     // Parse logs (for protocols like PumpFun that emit events in logs)
-    let mut is_created_buy = false;
+    let needs_pumpfun = filter.map(|f| f.includes_pumpfun()).unwrap_or(true);
+    let is_created_buy = needs_pumpfun
+        && crate::logs::optimized_matcher::detect_pumpfun_create(&grpc_meta.log_messages);
+    let mut active_program_stack: Vec<Pubkey> = Vec::with_capacity(8);
 
     for log in &grpc_meta.log_messages {
-        if let Some(mut event) = crate::logs::parse_log(
+        if let Some((pid, depth)) = crate::logs::optimized_matcher::parse_invoke_info(log) {
+            if let Ok(pk) = Pubkey::from_str(pid) {
+                active_program_stack.truncate(depth.saturating_sub(1));
+                active_program_stack.push(pk);
+            }
+        }
+
+        if let Some(mut event) = crate::logs::parse_log_with_program_id(
             log,
             signature,
             slot,
@@ -182,14 +181,10 @@ pub fn parse_rpc_transaction(
             filter,
             is_created_buy,
             recent_blockhash.as_deref(),
+            active_program_stack.last(),
         ) {
-            // Check if this is a PumpFun create event to set is_created_buy flag
-            if matches!(event, DexEvent::PumpFunCreate(_) | DexEvent::PumpFunCreateV2(_)) {
-                is_created_buy = true;
-            }
-
             // Fill account fields - use same function as gRPC parsing
-            crate::core::account_dispatcher::fill_accounts_from_transaction_data(
+            crate::core::account_dispatcher::fill_accounts_with_owned_keys(
                 &mut event,
                 &grpc_meta,
                 &grpc_tx_opt,
@@ -206,7 +201,17 @@ pub fn parse_rpc_transaction(
 
             events.push(event);
         }
+
+        if let Some(pid) = crate::logs::optimized_matcher::parse_program_complete_info(log) {
+            if let Ok(pk) = Pubkey::from_str(pid) {
+                if let Some(pos) = active_program_stack.iter().rposition(|active| *active == pk) {
+                    active_program_stack.truncate(pos);
+                }
+            }
+        }
     }
+
+    crate::core::pumpfun_fee_enrich::enrich_pumpfun_same_tx_post_merge(&mut events);
 
     Ok(events)
 }
@@ -358,7 +363,7 @@ pub fn convert_rpc_to_grpc(
                         program_id_index: compiled.program_id_index as u32,
                         accounts: compiled.accounts.clone(),
                         data,
-                        stack_height: compiled.stack_height.map(|h| h as u32),
+                        stack_height: compiled.stack_height,
                     });
                 }
             }

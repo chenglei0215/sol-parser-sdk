@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use yellowstone_grpc_client::{GeyserGrpcClient, Interceptor, ClientTlsConfig};
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient, Interceptor};
 
 /// 连接 Geyser 的常用选项（与业务无关）。
 #[derive(Debug, Clone)]
@@ -35,9 +35,7 @@ pub async fn connect_yellowstone_geyser(
         .max_decoding_message_size(config.max_decoding_message_size);
 
     if let Some(ref t) = config.x_token {
-        builder = builder
-            .x_token(Some(t.as_str()))
-            .map_err(|e| e.to_string())?;
+        builder = builder.x_token(Some(t.as_str())).map_err(|e| e.to_string())?;
     }
 
     if endpoint.starts_with("https://") {

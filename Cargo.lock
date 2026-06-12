@@ -272,7 +272,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2342,7 +2342,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -3973,7 +3973,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4295,12 +4295,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "sol-parser-sdk"
-version = "0.3.1"
+version = "0.5.14"
 dependencies = [
  "anyhow",
  "arrayref",
@@ -9330,14 +9330,17 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "12.1.0"
+version = "12.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab52445da59c3e710dd2128e3e49598cfa45c8ba7f30feb608cafbd404e5e8cf"
+checksum = "2339e00b46e772353a2f1eea2085ff07ccb6a8e50ceb2841e4156e4a351a264f"
 dependencies = [
  "anyhow",
  "prost 0.14.3",
  "prost-types 0.14.3",
  "protoc-bin-vendored",
+ "siphasher 1.0.1",
+ "solana-pubkey 4.2.0",
+ "thiserror 2.0.18",
  "tonic 0.14.5",
  "tonic-prost",
  "tonic-prost-build",

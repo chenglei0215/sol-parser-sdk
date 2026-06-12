@@ -8,6 +8,7 @@
 //! cargo run --example shredstream_pump_snipe -- --endpoint http://127.0.0.1:10800
 
 use sol_parser_sdk::core::now_micros;
+use sol_parser_sdk::grpc::{EventType, EventTypeFilter};
 use sol_parser_sdk::shredstream::{ShredStreamClient, ShredStreamConfig};
 use sol_parser_sdk::DexEvent;
 use std::collections::HashSet;
@@ -45,6 +46,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("Examples:");
                 println!("  cargo run --example shredstream_pump_snipe");
                 println!("  cargo run --example shredstream_pump_snipe -- --endpoint http://192.168.1.100:10800");
+                println!();
+                println!(
+                    "This example uses filter: PumpFunCreate + PumpFunCreateV2 + PumpFunTrade"
+                );
+                println!("For more filter presets, run: cargo run --example shredstream_example -- --help");
                 std::process::exit(0);
             }
             _ => {
@@ -68,7 +74,7 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
 
     println!("📋 Configuration:");
     println!("   Endpoint: {}", endpoint);
-    println!("   Target: PumpFun CREATE + is_created_buy events");
+    println!("   Target: PumpFun CREATE/CREATE_V2 + PumpFunTrade events");
     println!();
 
     // 创建客户端
@@ -77,8 +83,16 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
     println!("✅ ShredStream client connected");
     println!("🎧 Listening for PumpFun token creation and first buy...\n");
 
-    // 订阅并获取事件队列
-    let queue = client.subscribe().await?;
+    // ShredStream 使用本地热路径事件过滤。这个狙击示例需要 create + trade：
+    // - PumpFunCreate / PumpFunCreateV2 用来记录新 mint
+    // - PumpFunTrade 会把买/卖/精确 SOL 买入统一回调为 DexEvent::PumpFunTrade
+    // 其它可配置 filter preset 见 `shredstream_example --help`。
+    let event_filter = EventTypeFilter::include_only(vec![
+        EventType::PumpFunCreate,
+        EventType::PumpFunCreateV2,
+        EventType::PumpFunTrade,
+    ]);
+    let queue = client.subscribe_with_filter(Some(event_filter)).await?;
 
     // 用于追踪已创建的代币（检测同交易买入）
     let created_tokens: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
@@ -108,9 +122,15 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
                         consumer_created.lock().unwrap().insert(mint.clone());
 
                         println!("\n");
-                        println!("╔══════════════════════════════════════════════════════════════════╗");
-                        println!("║                   🎯 PUMPFUN 代币创建 (Legacy)                    ║");
-                        println!("╠══════════════════════════════════════════════════════════════════╣");
+                        println!(
+                            "╔══════════════════════════════════════════════════════════════════╗"
+                        );
+                        println!(
+                            "║                   🎯 PUMPFUN 代币创建 (Legacy)                    ║"
+                        );
+                        println!(
+                            "╠══════════════════════════════════════════════════════════════════╣"
+                        );
                         println!("║  代币名称: {:<50} ║", truncate(&create_event.name, 50));
                         println!("║  代币符号: {:<50} ║", truncate(&create_event.symbol, 50));
                         println!("║  Mint:     {:<50} ║", mint);
@@ -118,10 +138,15 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
                         println!("║  用户:     {:<50} ║", user);
                         println!("║  Bonding:  {:<50} ║", create_event.bonding_curve.to_string());
                         println!("║  Slot:     {:<50} ║", create_event.metadata.slot);
-                        println!("║  Sig:      {:<50} ║", truncate(&create_event.metadata.signature.to_string(), 50));
+                        println!(
+                            "║  Sig:      {:<50} ║",
+                            truncate(&create_event.metadata.signature.to_string(), 50)
+                        );
                         println!("╠────────────────────────────────────────────────────────────────────╣");
                         println!("║  📊 延迟:  {} μs", latency_us);
-                        println!("╚══════════════════════════════════════════════════════════════════╝");
+                        println!(
+                            "╚══════════════════════════════════════════════════════════════════╝"
+                        );
                     }
 
                     // ========== 代币创建 V2 事件 ==========
@@ -135,20 +160,34 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
                         consumer_created.lock().unwrap().insert(mint.clone());
 
                         println!("\n");
-                        println!("╔══════════════════════════════════════════════════════════════════╗");
-                        println!("║                 🎯 PUMPFUN 代币创建 V2 (SPL-22)                   ║");
-                        println!("╠══════════════════════════════════════════════════════════════════╣");
+                        println!(
+                            "╔══════════════════════════════════════════════════════════════════╗"
+                        );
+                        println!(
+                            "║                 🎯 PUMPFUN 代币创建 V2 (SPL-22)                   ║"
+                        );
+                        println!(
+                            "╠══════════════════════════════════════════════════════════════════╣"
+                        );
                         println!("║  代币名称: {:<50} ║", truncate(&create_v2_event.name, 50));
                         println!("║  代币符号: {:<50} ║", truncate(&create_v2_event.symbol, 50));
                         println!("║  Mint:     {:<50} ║", mint);
                         println!("║  创建者:   {:<50} ║", creator);
                         println!("║  用户:     {:<50} ║", user);
-                        println!("║  Bonding:  {:<50} ║", create_v2_event.bonding_curve.to_string());
+                        println!(
+                            "║  Bonding:  {:<50} ║",
+                            create_v2_event.bonding_curve.to_string()
+                        );
                         println!("║  Slot:     {:<50} ║", create_v2_event.metadata.slot);
-                        println!("║  Sig:      {:<50} ║", truncate(&create_v2_event.metadata.signature.to_string(), 50));
+                        println!(
+                            "║  Sig:      {:<50} ║",
+                            truncate(&create_v2_event.metadata.signature.to_string(), 50)
+                        );
                         println!("╠────────────────────────────────────────────────────────────────────╣");
                         println!("║  📊 延迟:  {} μs", latency_us);
-                        println!("╚══════════════════════════════════════════════════════════════════╝");
+                        println!(
+                            "╚══════════════════════════════════════════════════════════════════╝"
+                        );
                     }
 
                     // ========== 交易事件（检测 is_created_buy） ==========
@@ -174,12 +213,27 @@ async fn run_snipe_monitor(endpoint: &str) -> Result<(), Box<dyn std::error::Err
                                 println!("╠══════════════════════════════════════════════════════════════════╣");
                                 println!("║  Mint:        {:<47} ║", mint);
                                 println!("║  买入者:      {:<47} ║", trade_event.user.to_string());
-                                println!("║  Bonding:     {:<47} ║", trade_event.bonding_curve.to_string());
-                                println!("║  SOL 数量:    {:<47} ║", format!("{}", trade_event.sol_amount));
-                                println!("║  Token 数量:  {:<47} ║", format!("{}", trade_event.token_amount));
+                                println!(
+                                    "║  Bonding:     {:<47} ║",
+                                    trade_event.bonding_curve.to_string()
+                                );
+                                println!(
+                                    "║  SOL 数量:    {:<47} ║",
+                                    format!("{}", trade_event.sol_amount)
+                                );
+                                println!(
+                                    "║  Token 数量:  {:<47} ║",
+                                    format!("{}", trade_event.token_amount)
+                                );
                                 println!("║  Slot:        {:<47} ║", trade_event.metadata.slot);
-                                println!("║  新创建代币:  {:<47} ║", if is_new_token { "✅ 是" } else { "❌ 否" });
-                                println!("║  Sig:         {:<47} ║", truncate(&trade_event.metadata.signature.to_string(), 47));
+                                println!(
+                                    "║  新创建代币:  {:<47} ║",
+                                    if is_new_token { "✅ 是" } else { "❌ 否" }
+                                );
+                                println!(
+                                    "║  Sig:         {:<47} ║",
+                                    truncate(&trade_event.metadata.signature.to_string(), 47)
+                                );
                                 println!("╠────────────────────────────────────────────────────────────────────╣");
                                 println!("║  📊 延迟:     {} μs", latency_us);
                                 println!("╚══════════════════════════════════════════════════════════════════╝");

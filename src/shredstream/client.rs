@@ -1,49 +1,59 @@
 //! ShredStream 客户端
+//!
+//! `solana_entry::entry::Entry` 在 Agave SDK 中带 `deprecated`（需显式启用不稳定 feature 才消除）；
+//! 本模块仍依赖其 bincode 布局解码 Shred 侧 `entries` 负载。
+#![allow(deprecated)]
 
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
 use futures::StreamExt;
 use solana_entry::entry::Entry as SolanaEntry;
-use solana_sdk::pubkey::Pubkey;
+use solana_sdk::message::VersionedMessage;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
+use tonic::transport::{Channel, Endpoint};
 
-use crate::accounts::program_ids::SPL_TOKEN_2022_PROGRAM_ID;
 use crate::core::now_micros;
+use crate::grpc::types::EventTypeFilter;
 use crate::shredstream::config::ShredStreamConfig;
 use crate::shredstream::proto::{Entry, ShredstreamProxyClient, SubscribeEntriesRequest};
 use crate::DexEvent;
 
-/// 获取 token_program，如果为 default 则返回 Token-2022 Program
-/// 默认使用 Token-2022 更安全，因为 Token-2022 兼容 Token 账户，反之则不行
-#[inline]
-fn get_token_program_or_default(token_program: Pubkey) -> Pubkey {
-    if token_program == Pubkey::default() {
-        SPL_TOKEN_2022_PROGRAM_ID
-    } else {
-        token_program
-    }
+static SHREDSTREAM_DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+
+enum EventSink<'a> {
+    Queue(&'a Arc<ArrayQueue<DexEvent>>),
+    Callback(&'a (dyn Fn(DexEvent) + Send + Sync)),
 }
 
-// IxRef 类型定义 - 用于包装指令数据
-// 避免直接导入 CompiledInstruction 以解决版本冲突
-#[derive(Debug, Clone)]
-struct IxRef {
-    program_id_index: u8,
-    accounts: Vec<u8>,
-    data: Vec<u8>,
-}
-
-impl IxRef {
-    fn new(program_id_index: u8, accounts: Vec<u8>, data: Vec<u8>) -> Self {
-        Self {
-            program_id_index,
-            accounts,
-            data,
+impl EventSink<'_> {
+    #[inline]
+    fn deliver(&self, event: DexEvent) {
+        match self {
+            EventSink::Queue(queue) => {
+                if queue.push(event).is_err() {
+                    record_shredstream_dropped_event();
+                }
+            }
+            EventSink::Callback(callback) => callback(event),
         }
     }
+}
+
+#[inline]
+fn record_shredstream_dropped_event() -> u64 {
+    let dropped = SHREDSTREAM_DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped <= 10 || dropped.is_power_of_two() {
+        log::warn!(
+            target: "sol_parser_sdk::shredstream",
+            "ShredStream event queue is full; dropped event count={}",
+            dropped
+        );
+    }
+    dropped
 }
 
 /// ShredStream 客户端
@@ -67,7 +77,7 @@ impl ShredStreamClient {
     ) -> crate::common::AnyResult<Self> {
         let endpoint = endpoint.into();
         // 测试连接
-        let _ = ShredstreamProxyClient::connect(endpoint.clone()).await?;
+        let _ = Self::connect_client(&endpoint, &config).await?;
 
         Ok(Self { endpoint, config, subscription_handle: Arc::new(Mutex::new(None)) })
     }
@@ -76,6 +86,16 @@ impl ShredStreamClient {
     ///
     /// 返回一个队列，事件会被推送到该队列中
     pub async fn subscribe(&self) -> crate::common::AnyResult<Arc<ArrayQueue<DexEvent>>> {
+        self.subscribe_with_filter(None).await
+    }
+
+    /// 订阅 DEX 事件，并在 ShredStream 热路径中按 SDK 事件类型提前过滤。
+    ///
+    /// 过滤发生在解析分发前，用于低延迟场景避免解析不需要的协议/事件。
+    pub async fn subscribe_with_filter(
+        &self,
+        event_type_filter: Option<EventTypeFilter>,
+    ) -> crate::common::AnyResult<Arc<ArrayQueue<DexEvent>>> {
         // 停止现有订阅
         self.stop().await;
 
@@ -96,7 +116,14 @@ impl ShredStreamClient {
                 }
                 attempts += 1;
 
-                match Self::stream_events(&endpoint, &queue_clone).await {
+                match Self::stream_events(
+                    &endpoint,
+                    &config,
+                    event_type_filter.as_ref(),
+                    EventSink::Queue(&queue_clone),
+                )
+                .await
+                {
                     Ok(_) => {
                         delay = config.reconnect_delay_ms;
                         attempts = 0;
@@ -114,6 +141,59 @@ impl ShredStreamClient {
         Ok(queue)
     }
 
+    /// 订阅 DEX 事件，并在解析热路径中直接回调事件，避免跨任务队列调度。
+    ///
+    /// 这是最低延迟路径；回调会在 ShredStream 读流任务内执行，应避免阻塞 I/O 或重计算。
+    pub async fn subscribe_with_filter_callback<F>(
+        &self,
+        event_type_filter: Option<EventTypeFilter>,
+        callback: F,
+    ) -> crate::common::AnyResult<()>
+    where
+        F: Fn(DexEvent) + Send + Sync + 'static,
+    {
+        self.stop().await;
+
+        let endpoint = self.endpoint.clone();
+        let config = self.config.clone();
+        let callback = Arc::new(callback);
+
+        let handle = tokio::spawn(async move {
+            let mut delay = config.reconnect_delay_ms;
+            let mut attempts = 0u32;
+
+            loop {
+                if config.max_reconnect_attempts > 0 && attempts >= config.max_reconnect_attempts {
+                    log::error!("Max reconnection attempts reached, giving up");
+                    break;
+                }
+                attempts += 1;
+
+                match Self::stream_events_callback(
+                    &endpoint,
+                    &config,
+                    event_type_filter.as_ref(),
+                    callback.clone(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        delay = config.reconnect_delay_ms;
+                        attempts = 0;
+                    }
+                    Err(e) => {
+                        log::error!("ShredStream error: {} - retry in {}ms", e, delay);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                        delay = (delay * 2).min(60_000);
+                    }
+                }
+            }
+        });
+
+        *self.subscription_handle.lock().await = Some(handle);
+        Ok(())
+    }
+
     /// 停止订阅
     pub async fn stop(&self) {
         if let Some(handle) = self.subscription_handle.lock().await.take() {
@@ -121,24 +201,53 @@ impl ShredStreamClient {
         }
     }
 
+    async fn connect_client(
+        endpoint: &str,
+        config: &ShredStreamConfig,
+    ) -> crate::common::AnyResult<ShredstreamProxyClient<Channel>> {
+        let mut builder = Endpoint::from_shared(endpoint.to_string())?;
+        if config.connection_timeout_ms > 0 {
+            builder = builder.connect_timeout(Duration::from_millis(config.connection_timeout_ms));
+        }
+        let channel = builder.connect().await?;
+        Ok(ShredstreamProxyClient::new(channel)
+            .max_decoding_message_size(config.max_decoding_message_size))
+    }
+
     /// 核心事件流处理
     async fn stream_events(
         endpoint: &str,
-        queue: &Arc<ArrayQueue<DexEvent>>,
+        config: &ShredStreamConfig,
+        event_type_filter: Option<&EventTypeFilter>,
+        sink: EventSink<'_>,
     ) -> Result<(), String> {
-        let mut client = ShredstreamProxyClient::connect(endpoint.to_string())
-            .await
-            .map_err(|e| e.to_string())?;
+        let mut client = Self::connect_client(endpoint, config).await.map_err(|e| e.to_string())?;
         let request = tonic::Request::new(SubscribeEntriesRequest {});
-        let mut stream =
-            client.subscribe_entries(request).await.map_err(|e| e.to_string())?.into_inner();
+        let response = if config.request_timeout_ms > 0 {
+            tokio::time::timeout(
+                Duration::from_millis(config.request_timeout_ms),
+                client.subscribe_entries(request),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "ShredStream subscribe request timed out after {}ms",
+                    config.request_timeout_ms
+                )
+            })?
+            .map_err(|e| e.to_string())?
+        } else {
+            client.subscribe_entries(request).await.map_err(|e| e.to_string())?
+        };
+        let mut stream = response.into_inner();
 
         log::info!("ShredStream connected, receiving entries...");
 
+        let mut events = Vec::with_capacity(4);
         while let Some(message) = stream.next().await {
             match message {
                 Ok(entry) => {
-                    Self::process_entry(entry, queue);
+                    Self::process_entry(entry, event_type_filter, &sink, &mut events);
                 }
                 Err(e) => {
                     log::error!("Stream error: {:?}", e);
@@ -150,9 +259,29 @@ impl ShredStreamClient {
         Ok(())
     }
 
+    async fn stream_events_callback(
+        endpoint: &str,
+        config: &ShredStreamConfig,
+        event_type_filter: Option<&EventTypeFilter>,
+        callback: Arc<dyn Fn(DexEvent) + Send + Sync>,
+    ) -> Result<(), String> {
+        Self::stream_events(
+            endpoint,
+            config,
+            event_type_filter,
+            EventSink::Callback(callback.as_ref()),
+        )
+        .await
+    }
+
     /// 处理单个 Entry 消息
     #[inline]
-    fn process_entry(entry: Entry, queue: &Arc<ArrayQueue<DexEvent>>) {
+    fn process_entry(
+        entry: Entry,
+        event_type_filter: Option<&EventTypeFilter>,
+        sink: &EventSink<'_>,
+        events: &mut Vec<DexEvent>,
+    ) {
         let slot = entry.slot;
         let recv_us = now_micros();
 
@@ -166,9 +295,20 @@ impl ShredStreamClient {
         };
 
         // 处理每个 Entry 中的交易
+        let mut tx_index = 0u64;
         for entry in entries {
-            for (tx_index, transaction) in entry.transactions.iter().enumerate() {
-                Self::process_transaction(transaction, slot, recv_us, tx_index as u64, queue);
+            for transaction in entry.transactions.iter() {
+                events.clear();
+                Self::process_transaction(
+                    transaction,
+                    slot,
+                    recv_us,
+                    tx_index,
+                    event_type_filter,
+                    events,
+                    sink,
+                );
+                tx_index += 1;
             }
         }
     }
@@ -180,627 +320,170 @@ impl ShredStreamClient {
         slot: u64,
         recv_us: i64,
         tx_index: u64,
-        queue: &Arc<ArrayQueue<DexEvent>>,
+        event_type_filter: Option<&EventTypeFilter>,
+        events: &mut Vec<DexEvent>,
+        sink: &EventSink<'_>,
+    ) {
+        if transaction.signatures.is_empty() {
+            return;
+        }
+
+        Self::parse_transaction_events(
+            transaction,
+            slot,
+            recv_us,
+            tx_index,
+            event_type_filter,
+            events,
+        );
+
+        for event in events.drain(..) {
+            sink.deliver(event);
+        }
+    }
+
+    #[inline]
+    fn parse_transaction_events(
+        transaction: &solana_sdk::transaction::VersionedTransaction,
+        slot: u64,
+        recv_us: i64,
+        tx_index: u64,
+        event_type_filter: Option<&EventTypeFilter>,
+        events: &mut Vec<DexEvent>,
     ) {
         if transaction.signatures.is_empty() {
             return;
         }
 
         let signature = transaction.signatures[0];
-        let accounts: Vec<_> = transaction.message.static_account_keys().to_vec();
-
-        // 解析交易中的指令
-        let mut events = Vec::new();
-        Self::parse_transaction_instructions(
+        if let VersionedMessage::V0(m) = &transaction.message {
+            if !m.address_table_lookups.is_empty() {
+                log::trace!(
+                    target: "sol_parser_sdk::shredstream",
+                    "V0 tx uses address lookup tables; shred parser will use static accounts and default placeholders for ALT-loaded accounts"
+                );
+            }
+        }
+        // 热路径：`static_account_keys` 零拷贝、`pump_ix` 内不克隆 CompiledInstruction。
+        super::pump_ix::parse_transaction_dex_events_with_filter(
             transaction,
-            &accounts,
             signature,
             slot,
             tx_index,
             recv_us,
-            &mut events,
+            event_type_filter,
+            events,
         );
-        crate::core::pumpfun_fee_enrich::enrich_create_v2_observed_fee_recipient(&mut events);
+        crate::core::pumpfun_fee_enrich::enrich_pumpfun_same_tx_post_merge(events);
 
-        // 推送到队列
-        for mut event in events {
-            // 填充接收时间戳
+        for event in events.iter_mut() {
             if let Some(meta) = event.metadata_mut() {
                 meta.grpc_recv_us = recv_us;
             }
-            let _ = queue.push(event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::events::{EventMetadata, PumpFunCreateTokenEvent};
+    use crate::instr::program_ids::PUMPFUN_PROGRAM_ID;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::message::{
+        compiled_instruction::CompiledInstruction, v0, MessageHeader, VersionedMessage,
+    };
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::Signature;
+    use solana_sdk::transaction::VersionedTransaction;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    fn push_string(data: &mut Vec<u8>, value: &str) {
+        data.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        data.extend_from_slice(value.as_bytes());
+    }
+
+    fn pumpfun_create_data() -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&[24, 30, 200, 40, 5, 28, 7, 119]);
+        push_string(&mut data, "Callback Test");
+        push_string(&mut data, "CBT");
+        push_string(&mut data, "https://example.invalid/callback.json");
+        data.extend_from_slice(Pubkey::new_unique().as_ref());
+        data
+    }
+
+    fn pumpfun_create_tx() -> VersionedTransaction {
+        let mut account_keys = (0..10).map(|_| Pubkey::new_unique()).collect::<Vec<_>>();
+        account_keys.push(PUMPFUN_PROGRAM_ID);
+
+        VersionedTransaction {
+            signatures: vec![Signature::default()],
+            message: VersionedMessage::V0(v0::Message {
+                header: MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 0,
+                },
+                account_keys,
+                recent_blockhash: Hash::default(),
+                instructions: vec![CompiledInstruction::new_from_raw_parts(
+                    10,
+                    pumpfun_create_data(),
+                    (0..10).collect(),
+                )],
+                address_table_lookups: Vec::new(),
+            }),
         }
     }
 
-    /// 解析交易指令，提取 PumpFun 事件
-    #[inline]
-    fn parse_transaction_instructions(
-        transaction: &solana_sdk::transaction::VersionedTransaction,
-        accounts: &[solana_sdk::pubkey::Pubkey],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-        events: &mut Vec<DexEvent>,
-    ) {
-        use solana_sdk::message::VersionedMessage;
+    #[test]
+    fn dropped_counter_increments_without_panicking() {
+        let before = SHREDSTREAM_DROPPED_EVENTS.load(Ordering::Relaxed);
+        let queue = ArrayQueue::new(1);
 
-        let message = &transaction.message;
+        queue
+            .push(DexEvent::PumpFunCreate(PumpFunCreateTokenEvent {
+                metadata: EventMetadata::default(),
+                ..Default::default()
+            }))
+            .expect("first push fits");
 
-        // 获取所有指令
-        let instructions: Vec<IxRef> = match message {
-            VersionedMessage::Legacy(msg) => {
-                msg.instructions.iter().map(|ix| IxRef::new(ix.program_id_index, ix.accounts.clone(), ix.data.clone())).collect()
-            }
-            VersionedMessage::V0(msg) => {
-                msg.instructions.iter().map(|ix| IxRef::new(ix.program_id_index, ix.accounts.clone(), ix.data.clone())).collect()
-            }
-        };
-
-        // 检测 CREATE/CREATE_V2 指令创建的 mint 地址（用于精确判断 is_created_buy 和 mayhem_mode）
-        let (created_mints, mayhem_mints) = Self::detect_pumpfun_create_mints(&instructions, accounts);
-
-        // 解析每个指令
-        for ix in &instructions {
-            let program_id = accounts.get(ix.program_id_index as usize);
-
-            // 只处理 PumpFun 指令
-            if let Some(program_id) = program_id {
-                if *program_id == crate::instr::pump::PROGRAM_ID_PUBKEY {
-                    if let Some(event) = Self::parse_pumpfun_instruction(
-                        &ix.data,
-                        accounts,
-                        &ix.accounts,
-                        signature,
-                        slot,
-                        tx_index,
-                        recv_us,
-                        &created_mints,
-                        &mayhem_mints,
-                    ) {
-                        events.push(event);
-                    }
-                }
-            }
+        if queue
+            .push(DexEvent::PumpFunCreate(PumpFunCreateTokenEvent {
+                metadata: EventMetadata::default(),
+                ..Default::default()
+            }))
+            .is_err()
+        {
+            record_shredstream_dropped_event();
         }
+
+        assert!(SHREDSTREAM_DROPPED_EVENTS.load(Ordering::Relaxed) > before);
     }
 
-    /// 检测交易中 PumpFun CREATE/CREATE_V2 指令创建的 mint 地址
-    /// 返回 (created_mints, mayhem_mints) 元组：
-    /// - created_mints: 所有创建的 mint 地址集合（用于精确判断 is_created_buy）
-    /// - mayhem_mints: Mayhem Mode 代币的 mint 地址集合
-    ///
-    /// Mayhem Mode 判断方式（与 IDL `create_v2` 指令数据中的 `is_mayhem_mode` 一致）：
-    /// - CREATE_V2：从 ix data（disc 之后）解析 `is_mayhem_mode`，**不能**用账户 #10 Mayhem Program 推断（非 Mayhem 时该账户仍存在）
-    /// - CREATE 指令创建的代币不是 Mayhem Mode
-    #[inline]
-    fn detect_pumpfun_create_mints(
-        instructions: &[IxRef],
-        accounts: &[Pubkey],
-    ) -> (HashSet<Pubkey>, HashSet<Pubkey>) {
-        use crate::instr::pump::discriminators;
+    #[test]
+    fn callback_path_delivers_events_without_queue() {
+        let entries = vec![SolanaEntry {
+            num_hashes: 1,
+            hash: Hash::default(),
+            transactions: vec![pumpfun_create_tx()],
+        }];
+        let entry = Entry { slot: 42, entries: bincode::serialize(&entries).unwrap() };
+        let count = AtomicUsize::new(0);
 
-        let mut created_mints = HashSet::new();
-        let mut mayhem_mints = HashSet::new();
+        let mut events = Vec::with_capacity(4);
+        ShredStreamClient::process_entry(
+            entry,
+            None,
+            &EventSink::Callback(&|event| {
+                assert!(matches!(event, DexEvent::PumpFunCreate(_)));
+                assert_eq!(event.metadata().slot, 42);
+                count.fetch_add(1, AtomicOrdering::Relaxed);
+            }),
+            &mut events,
+        );
 
-        for ix in instructions {
-            if let Some(program_id) = accounts.get(ix.program_id_index as usize) {
-                if *program_id == crate::instr::pump::PROGRAM_ID_PUBKEY {
-                    if ix.data.len() >= 8 {
-                        let disc: [u8; 8] = ix.data[0..8].try_into().unwrap_or_default();
-                        if disc == discriminators::CREATE || disc == discriminators::CREATE_V2 {
-                            // CREATE/CREATE_V2 指令中 mint 在账户索引 0
-                            if let Some(&mint_idx) = ix.accounts.get(0) {
-                                if let Some(&mint) = accounts.get(mint_idx as usize) {
-                                    created_mints.insert(mint);
-
-                                    if disc == discriminators::CREATE_V2 {
-                                        let is_mayhem = crate::instr::utils::parse_create_v2_tail_fields(
-                                            &ix.data[8..],
-                                        )
-                                        .map(|(_, m, _)| m)
-                                        .unwrap_or(false);
-                                        if is_mayhem {
-                                            mayhem_mints.insert(mint);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        (created_mints, mayhem_mints)
-    }
-
-    /// 解析单个 PumpFun 指令
-    #[inline]
-    fn parse_pumpfun_instruction(
-        data: &[u8],
-        accounts: &[Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-        created_mints: &HashSet<Pubkey>,
-        mayhem_mints: &HashSet<Pubkey>,
-    ) -> Option<DexEvent> {
-        use crate::instr::pump::discriminators;
-        use crate::instr::utils::*;
-
-        if data.len() < 8 {
-            return None;
-        }
-
-        let disc: [u8; 8] = data[0..8].try_into().ok()?;
-        let ix_data = &data[8..];
-
-        // 获取指令中的账户
-        let get_account = |idx: usize| -> Option<Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        match disc {
-            // CREATE 指令
-            d if d == discriminators::CREATE => {
-                Self::parse_create_instruction(data, accounts, ix_accounts, signature, slot, tx_index, recv_us)
-            }
-            // CREATE_V2 指令
-            d if d == discriminators::CREATE_V2 => {
-                Self::parse_create_v2_instruction(data, accounts, ix_accounts, signature, slot, tx_index, recv_us)
-            }
-            // BUY 指令
-            d if d == discriminators::BUY => {
-                Self::parse_buy_instruction(
-                    ix_data, accounts, ix_accounts, signature, slot, tx_index, recv_us, created_mints, mayhem_mints,
-                )
-            }
-            // SELL 指令
-            d if d == discriminators::SELL => {
-                Self::parse_sell_instruction(ix_data, accounts, ix_accounts, signature, slot, tx_index, recv_us)
-            }
-            // BUY_EXACT_SOL_IN 指令
-            d if d == discriminators::BUY_EXACT_SOL_IN => {
-                Self::parse_buy_exact_sol_in_instruction(
-                    ix_data, accounts, ix_accounts, signature, slot, tx_index, recv_us, created_mints, mayhem_mints,
-                )
-            }
-            _ => None,
-        }
-    }
-
-    /// 解析 CREATE 指令
-    ///
-    /// CREATE 指令账户映射 (from IDL):
-    /// 0: mint, 1: mint_authority, 2: bonding_curve, 3: associated_bonding_curve,
-    /// 4: global, 5: mpl_token_metadata, 6: metadata, 7: user, ...
-    #[inline]
-    fn parse_create_instruction(
-        data: &[u8],
-        accounts: &[solana_sdk::pubkey::Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-    ) -> Option<DexEvent> {
-        use crate::instr::utils::*;
-        use crate::core::events::*;
-
-        // CREATE 指令至少需要 10 个账户（0..9 含 token_program）
-        if ix_accounts.len() < 10 {
-            return None;
-        }
-
-        let get_account = |idx: usize| -> Option<solana_sdk::pubkey::Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        let mut offset = 8; // 跳过 discriminator
-
-        // 解析 name (string)
-        let name = if let Some((s, len)) = read_str_unchecked(data, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-
-        // 解析 symbol (string)
-        let symbol = if let Some((s, len)) = read_str_unchecked(data, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-
-        // 解析 uri (string)
-        let uri = if let Some((s, len)) = read_str_unchecked(data, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-
-        // 从指令数据中读取 creator（在 name, symbol, uri 之后）
-        let creator = if offset + 32 <= data.len() {
-            read_pubkey(data, offset).unwrap_or_default()
-        } else {
-            solana_sdk::pubkey::Pubkey::default()
-        };
-
-        // 从账户中读取 mint, bonding_curve, user
-        let mint = get_account(0)?;
-        let bonding_curve = get_account(2).unwrap_or_default();
-        let user = get_account(7).unwrap_or_default();
-
-        let metadata = EventMetadata {
-            signature,
-            slot,
-            tx_index,
-            block_time_us: 0, // ShredStream 不提供 block_time
-            grpc_recv_us: recv_us,
-            recent_blockhash: None,
-        };
-
-        Some(DexEvent::PumpFunCreate(PumpFunCreateTokenEvent {
-            metadata,
-            name,
-            symbol,
-            uri,
-            mint,
-            bonding_curve,
-            user,
-            creator,
-            token_program: get_account(9).unwrap_or_default(),
-            ..Default::default()
-        }))
-    }
-
-    /// 解析 CREATE_V2 指令
-    ///
-    /// CREATE_V2 指令账户映射 (from IDL):
-    /// 0: mint, 1: mint_authority, 2: bonding_curve, 3: associated_bonding_curve,
-    /// 4: global, 5: user, 6: system_program, 7: token_program, ...
-    #[inline]
-    fn parse_create_v2_instruction(
-        data: &[u8],
-        accounts: &[solana_sdk::pubkey::Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-    ) -> Option<DexEvent> {
-        use crate::instr::utils::*;
-        use crate::core::events::*;
-
-        const CREATE_V2_MIN_ACCOUNTS: usize = 16;
-        if ix_accounts.len() < CREATE_V2_MIN_ACCOUNTS {
-            return None;
-        }
-
-        let get_account = |idx: usize| -> Option<solana_sdk::pubkey::Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        let payload = &data[8..];
-        let mut offset = 0usize;
-        let name = if let Some((s, len)) = read_str_unchecked(payload, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-        let symbol = if let Some((s, len)) = read_str_unchecked(payload, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-        let uri = if let Some((s, len)) = read_str_unchecked(payload, offset) {
-            offset += len;
-            s.to_string()
-        } else {
-            String::new()
-        };
-        if payload.len() < offset + 32 + 1 {
-            return None;
-        }
-        let creator = read_pubkey(payload, offset).unwrap_or_default();
-        offset += 32;
-        let is_mayhem_mode = read_bool(payload, offset).unwrap_or(false);
-        offset += 1;
-        let is_cashback_enabled = read_bool(payload, offset).unwrap_or(false);
-
-        let mint = get_account(0)?;
-        let bonding_curve = get_account(2).unwrap_or_default();
-        let user = get_account(5).unwrap_or_default();
-
-        let metadata = EventMetadata {
-            signature,
-            slot,
-            tx_index,
-            block_time_us: 0,
-            grpc_recv_us: recv_us,
-            recent_blockhash: None,
-        };
-
-        let mayhem_program_id = get_account(9).unwrap_or_default();
-
-        Some(DexEvent::PumpFunCreateV2(PumpFunCreateV2TokenEvent {
-            metadata,
-            name,
-            symbol,
-            uri,
-            mint,
-            bonding_curve,
-            user,
-            creator,
-            mint_authority: get_account(1).unwrap_or_default(),
-            associated_bonding_curve: get_account(3).unwrap_or_default(),
-            global: get_account(4).unwrap_or_default(),
-            system_program: get_account(6).unwrap_or_default(),
-            token_program: get_account(7).unwrap_or_default(),
-            associated_token_program: get_account(8).unwrap_or_default(),
-            mayhem_program_id,
-            global_params: get_account(10).unwrap_or_default(),
-            sol_vault: get_account(11).unwrap_or_default(),
-            mayhem_state: get_account(12).unwrap_or_default(),
-            mayhem_token_vault: get_account(13).unwrap_or_default(),
-            event_authority: get_account(14).unwrap_or_default(),
-            program: get_account(15).unwrap_or_default(),
-            is_mayhem_mode,
-            is_cashback_enabled,
-            ..Default::default()
-        }))
-    }
-
-    /// 解析 BUY 指令
-    #[inline]
-    fn parse_buy_instruction(
-        data: &[u8],
-        accounts: &[Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-        created_mints: &HashSet<Pubkey>,
-        mayhem_mints: &HashSet<Pubkey>,
-    ) -> Option<DexEvent> {
-        use crate::instr::utils::*;
-        use crate::core::events::*;
-
-        if ix_accounts.len() < 7 {
-            return None;
-        }
-
-        let get_account = |idx: usize| -> Option<Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        // 解析参数: amount (u64), max_sol_cost (u64)
-        let (token_amount, sol_amount) = if data.len() >= 16 {
-            (read_u64_le(data, 0).unwrap_or(0), read_u64_le(data, 8).unwrap_or(0))
-        } else {
-            (0, 0)
-        };
-
-        let mint = get_account(2)?;
-        
-        // 🔧 关键修复：只有当 mint 在 created_mints 中时，才标记为 is_created_buy
-        let is_created_buy = created_mints.contains(&mint);
-        
-        // 🔧 Mayhem Mode 检测：CREATE_V2 指令创建的代币是 Mayhem Mode
-        let is_mayhem_mode = mayhem_mints.contains(&mint);
-        
-        let metadata = EventMetadata {
-            signature,
-            slot,
-            tx_index,
-            block_time_us: 0,
-            grpc_recv_us: recv_us,
-            recent_blockhash: None,
-        };
-
-        Some(DexEvent::PumpFunTrade(PumpFunTradeEvent {
-            metadata,
-            mint,
-            bonding_curve: get_account(3).unwrap_or_default(),
-            user: get_account(6).unwrap_or_default(),
-            sol_amount,
-            token_amount,
-            fee_recipient: get_account(1).unwrap_or_default(),
-            is_buy: true,
-            is_created_buy,
-            timestamp: 0,
-            virtual_sol_reserves: 0,
-            virtual_token_reserves: 0,
-            real_sol_reserves: 0,
-            real_token_reserves: 0,
-            fee_basis_points: 0,
-            fee: 0,
-            creator: Pubkey::default(),
-            creator_fee_basis_points: 0,
-            creator_fee: 0,
-            track_volume: false,
-            total_unclaimed_tokens: 0,
-            total_claimed_tokens: 0,
-            current_sol_volume: 0,
-            last_update_timestamp: 0,
-            ix_name: "buy".to_string(),
-            mayhem_mode: is_mayhem_mode,
-            cashback_fee_basis_points: 0,
-            cashback: 0,
-            is_cashback_coin: false,
-            associated_bonding_curve: get_account(4).unwrap_or_default(),
-            token_program: get_token_program_or_default(get_account(8).unwrap_or_default()),
-            creator_vault: get_account(9).unwrap_or_default(),
-            account: None,
-        }))
-    }
-
-    /// 解析 SELL 指令
-    #[inline]
-    fn parse_sell_instruction(
-        data: &[u8],
-        accounts: &[solana_sdk::pubkey::Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-    ) -> Option<DexEvent> {
-        use crate::instr::utils::*;
-        use crate::core::events::*;
-
-        if ix_accounts.len() < 7 {
-            return None;
-        }
-
-        let get_account = |idx: usize| -> Option<solana_sdk::pubkey::Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        // 解析参数: amount (u64), min_sol_output (u64)
-        let (token_amount, sol_amount) = if data.len() >= 16 {
-            (read_u64_le(data, 0).unwrap_or(0), read_u64_le(data, 8).unwrap_or(0))
-        } else {
-            (0, 0)
-        };
-
-        let mint = get_account(2)?;
-        let metadata = EventMetadata {
-            signature,
-            slot,
-            tx_index,
-            block_time_us: 0,
-            grpc_recv_us: recv_us,
-            recent_blockhash: None,
-        };
-
-        Some(DexEvent::PumpFunTrade(PumpFunTradeEvent {
-            metadata,
-            mint,
-            bonding_curve: get_account(3).unwrap_or_default(),
-            user: get_account(6).unwrap_or_default(),
-            sol_amount,
-            token_amount,
-            fee_recipient: get_account(1).unwrap_or_default(),
-            is_buy: false,
-            is_created_buy: false,
-            timestamp: 0,
-            virtual_sol_reserves: 0,
-            virtual_token_reserves: 0,
-            real_sol_reserves: 0,
-            real_token_reserves: 0,
-            fee_basis_points: 0,
-            fee: 0,
-            creator: Pubkey::default(),
-            creator_fee_basis_points: 0,
-            creator_fee: 0,
-            track_volume: false,
-            total_unclaimed_tokens: 0,
-            total_claimed_tokens: 0,
-            current_sol_volume: 0,
-            last_update_timestamp: 0,
-            ix_name: "sell".to_string(),
-            mayhem_mode: false,
-            cashback_fee_basis_points: 0,
-            cashback: 0,
-            is_cashback_coin: false,
-            associated_bonding_curve: get_account(4).unwrap_or_default(),
-            token_program: get_token_program_or_default(get_account(9).unwrap_or_default()),
-            creator_vault: get_account(8).unwrap_or_default(),
-            account: None,
-        }))
-    }
-
-    /// 解析 BUY_EXACT_SOL_IN 指令
-    #[inline]
-    fn parse_buy_exact_sol_in_instruction(
-        data: &[u8],
-        accounts: &[Pubkey],
-        ix_accounts: &[u8],
-        signature: solana_sdk::signature::Signature,
-        slot: u64,
-        tx_index: u64,
-        recv_us: i64,
-        created_mints: &HashSet<Pubkey>,
-        mayhem_mints: &HashSet<Pubkey>,
-    ) -> Option<DexEvent> {
-        use crate::instr::utils::*;
-        use crate::core::events::*;
-
-        if ix_accounts.len() < 7 {
-            return None;
-        }
-
-        let get_account = |idx: usize| -> Option<Pubkey> {
-            ix_accounts.get(idx).and_then(|&i| accounts.get(i as usize)).copied()
-        };
-
-        // 解析参数: spendable_sol_in (u64), min_tokens_out (u64)
-        let (sol_amount, token_amount) = if data.len() >= 16 {
-            (read_u64_le(data, 0).unwrap_or(0), read_u64_le(data, 8).unwrap_or(0))
-        } else {
-            (0, 0)
-        };
-
-        let mint = get_account(2)?;
-        
-        // 🔧 关键修复：只有当 mint 在 created_mints 中时，才标记为 is_created_buy
-        let is_created_buy = created_mints.contains(&mint);
-        
-        // 🔧 Mayhem Mode 检测：CREATE_V2 指令创建的代币是 Mayhem Mode
-        let is_mayhem_mode = mayhem_mints.contains(&mint);
-        
-        let metadata = EventMetadata {
-            signature,
-            slot,
-            tx_index,
-            block_time_us: 0,
-            grpc_recv_us: recv_us,
-            recent_blockhash: None,
-        };
-
-        Some(DexEvent::PumpFunTrade(PumpFunTradeEvent {
-            metadata,
-            mint,
-            bonding_curve: get_account(3).unwrap_or_default(),
-            user: get_account(6).unwrap_or_default(),
-            sol_amount,
-            token_amount,
-            fee_recipient: get_account(1).unwrap_or_default(),
-            is_buy: true,
-            is_created_buy,
-            timestamp: 0,
-            virtual_sol_reserves: 0,
-            virtual_token_reserves: 0,
-            real_sol_reserves: 0,
-            real_token_reserves: 0,
-            fee_basis_points: 0,
-            fee: 0,
-            creator: Pubkey::default(),
-            creator_fee_basis_points: 0,
-            creator_fee: 0,
-            track_volume: false,
-            total_unclaimed_tokens: 0,
-            total_claimed_tokens: 0,
-            current_sol_volume: 0,
-            last_update_timestamp: 0,
-            ix_name: "buy_exact_sol_in".to_string(),
-            mayhem_mode: is_mayhem_mode,
-            cashback_fee_basis_points: 0,
-            cashback: 0,
-            is_cashback_coin: false,
-            associated_bonding_curve: get_account(4).unwrap_or_default(),
-            token_program: get_token_program_or_default(get_account(8).unwrap_or_default()),
-            creator_vault: get_account(9).unwrap_or_default(),
-            account: None,
-        }))
+        assert_eq!(count.load(AtomicOrdering::Relaxed), 1);
     }
 }
