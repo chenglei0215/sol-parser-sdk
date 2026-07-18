@@ -60,8 +60,12 @@ pub(crate) fn parse_transaction_core(
         || parse_instructions(meta, &info.transaction, sig, slot, idx, block_us, grpc_us, filter),
     );
 
-    let events =
+    let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
+    crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
+        &mut events,
+        &info.transaction,
+    );
     if let Some(filter) = filter {
         events.into_iter().map(|e| filter.normalize_dex_event(e)).collect()
     } else {
@@ -115,8 +119,12 @@ fn parse_transaction_core_sequential(
     let instr_events =
         parse_instructions(meta, &info.transaction, sig, slot, idx, block_us, grpc_us, filter);
 
-    let events =
+    let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
+    crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
+        &mut events,
+        &info.transaction,
+    );
     if let Some(filter) = filter {
         events.into_iter().map(|e| filter.normalize_dex_event(e)).collect()
     } else {

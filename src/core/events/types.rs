@@ -142,6 +142,12 @@ pub struct PumpFunTradeEvent {
     pub is_buy: bool,
     #[borsh(skip)]
     pub is_created_buy: bool, // 由外层逻辑设置，不在 Borsh 数据中
+    /// 外层 Solana 交易 fee payer（静态账户第 0 位）。
+    ///
+    /// 路由/CPI 买卖时它可能与 PumpFun 内层 `user` 不同，风控应分别使用两者。
+    #[borsh(skip)]
+    #[serde(default)]
+    pub transaction_fee_payer: Pubkey,
     pub user: Pubkey,
     pub timestamp: i64,
     pub virtual_sol_reserves: u64,

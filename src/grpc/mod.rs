@@ -33,6 +33,7 @@ pub use transaction_meta::{
     collect_account_keys_bs58, collect_watch_transfer_counterparty_pairs,
     heuristic_sol_counterparties_for_watched_keys, lamport_balance_deltas,
     spl_token_counterparty_by_owner, token_balance_raw_amount, try_yellowstone_signature,
+    yellowstone_fee_payer,
 };
 pub use types::{
     account_filter_memcmp, AccountFilter, ClientConfig, EventType as StreamingEventType,

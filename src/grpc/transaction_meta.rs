@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::instr::read_pubkey_fast;
+use crate::DexEvent;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use yellowstone_grpc_proto::prelude::{TokenBalance, Transaction, TransactionStatusMeta};
@@ -194,6 +195,40 @@ pub fn yellowstone_static_account_keys_arc(tx: &Option<Transaction>) -> Arc<[Pub
     Arc::from(keys.into_boxed_slice())
 }
 
+/// Yellowstone 交易的 fee payer（消息静态账户第 0 位）。
+#[inline]
+pub fn yellowstone_fee_payer(tx: &Option<Transaction>) -> Pubkey {
+    tx.as_ref()
+        .and_then(|t| t.message.as_ref())
+        .and_then(|msg| msg.account_keys.first())
+        .map_or(Pubkey::default(), |bytes| read_pubkey_fast(bytes.as_slice()))
+}
+
+/// 将外层交易 fee payer 补充到 PumpFun trade 事件。
+///
+/// 该字段在 log/instruction 去重完成后统一填充，避免合并时被默认值覆盖。
+#[inline]
+pub(crate) fn fill_pumpfun_transaction_fee_payer(
+    events: &mut [DexEvent],
+    tx: &Option<Transaction>,
+) {
+    let fee_payer = yellowstone_fee_payer(tx);
+    if fee_payer == Pubkey::default() {
+        return;
+    }
+    for event in events {
+        match event {
+            DexEvent::PumpFunTrade(e)
+            | DexEvent::PumpFunBuy(e)
+            | DexEvent::PumpFunSell(e)
+            | DexEvent::PumpFunBuyExactSolIn(e) => {
+                e.transaction_fee_payer = fee_payer;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Yellowstone 交易签名原始字节（64）→ `solana_sdk::signature::Signature`。
 #[inline]
 pub fn try_yellowstone_signature(sig: &[u8]) -> Option<Signature> {
@@ -202,4 +237,36 @@ pub fn try_yellowstone_signature(sig: &[u8]) -> Option<Signature> {
     }
     let a: [u8; 64] = sig.try_into().ok()?;
     Some(Signature::from(a))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::events::PumpFunTradeEvent;
+    use yellowstone_grpc_proto::prelude::Message;
+
+    #[test]
+    fn fills_outer_fee_payer_without_overwriting_pumpfun_user() {
+        let fee_payer = Pubkey::new_unique();
+        let inner_user = Pubkey::new_unique();
+        let tx = Some(Transaction {
+            message: Some(Message {
+                account_keys: vec![fee_payer.to_bytes().to_vec()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let mut events = vec![DexEvent::PumpFunTrade(PumpFunTradeEvent {
+            user: inner_user,
+            ..Default::default()
+        })];
+
+        fill_pumpfun_transaction_fee_payer(&mut events, &tx);
+
+        let DexEvent::PumpFunTrade(event) = &events[0] else {
+            panic!("expected PumpFunTrade");
+        };
+        assert_eq!(event.user, inner_user);
+        assert_eq!(event.transaction_fee_payer, fee_payer);
+    }
 }
