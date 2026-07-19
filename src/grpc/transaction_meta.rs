@@ -2,7 +2,7 @@
 //!
 //! 不依赖 DEX 日志或指令解析，适用于：mentions 订阅后的 SOL/SPL 转账分析、审计、风控等。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::instr::read_pubkey_fast;
@@ -229,6 +229,100 @@ pub(crate) fn fill_pumpfun_transaction_fee_payer(
     }
 }
 
+/// 用交易 token balance 中的 ATA owner 修正 instruction 路 PumpFun 事件用户。
+///
+/// 批量/路由交易的 fee payer 和每段 PumpFun CPI 的真实用户可能不同。instruction
+/// 账户解析偶尔会把外层账户填进 `user`，但 `associated_user` 对应 token balance 的
+/// owner 是该段交易的真实钱包。该修正在 log/ix 去重前执行，使 instruction 事件能
+/// 与权威的 TradeEvent log 正确配对，同时保留同签名中的多个真实用户。
+pub(crate) fn fill_pumpfun_instruction_users_from_token_balances(
+    events: &mut [DexEvent],
+    tx: &Option<Transaction>,
+    meta: &TransactionStatusMeta,
+) {
+    if !events.iter().any(|event| {
+        matches!(
+            event,
+            DexEvent::PumpFunTrade(_)
+                | DexEvent::PumpFunBuy(_)
+                | DexEvent::PumpFunSell(_)
+                | DexEvent::PumpFunBuyExactSolIn(_)
+        )
+    }) {
+        return;
+    }
+    let Some(keys) = collect_account_keys_pubkeys(tx, meta) else {
+        return;
+    };
+
+    let mut owners: HashMap<(Pubkey, Pubkey), Pubkey> = HashMap::new();
+    for balance in meta.pre_token_balances.iter().chain(meta.post_token_balances.iter()) {
+        let Some(account) = keys.get(balance.account_index as usize).copied() else {
+            continue;
+        };
+        let Ok(mint) = balance.mint.parse::<Pubkey>() else {
+            continue;
+        };
+        let Ok(owner) = balance.owner.parse::<Pubkey>() else {
+            continue;
+        };
+        if owner != Pubkey::default() {
+            owners.insert((account, mint), owner);
+        }
+    }
+
+    for event in events {
+        let trade = match event {
+            DexEvent::PumpFunTrade(e)
+            | DexEvent::PumpFunBuy(e)
+            | DexEvent::PumpFunSell(e)
+            | DexEvent::PumpFunBuyExactSolIn(e) => e,
+            _ => continue,
+        };
+        if trade.associated_user == Pubkey::default() {
+            continue;
+        }
+        if let Some(owner) = owners.get(&(trade.associated_user, trade.mint)) {
+            if trade.user != *owner {
+                tracing::info!(
+                    target: "parser_user_fix",
+                    "pumpfun_user_attribution_corrected: signature={} mint={} old_user={} real_user={} associated_user={} slot={} tx_index={}",
+                    trade.metadata.signature,
+                    trade.mint,
+                    trade.user,
+                    owner,
+                    trade.associated_user,
+                    trade.metadata.slot,
+                    trade.metadata.tx_index
+                );
+            }
+            trade.user = *owner;
+        }
+    }
+}
+
+fn collect_account_keys_pubkeys(
+    tx: &Option<Transaction>,
+    meta: &TransactionStatusMeta,
+) -> Option<Vec<Pubkey>> {
+    let msg = tx.as_ref()?.message.as_ref()?;
+    let mut keys = Vec::with_capacity(
+        msg.account_keys.len()
+            + meta.loaded_writable_addresses.len()
+            + meta.loaded_readonly_addresses.len(),
+    );
+    for bytes in msg
+        .account_keys
+        .iter()
+        .chain(meta.loaded_writable_addresses.iter())
+        .chain(meta.loaded_readonly_addresses.iter())
+    {
+        let raw: [u8; 32] = bytes.as_slice().try_into().ok()?;
+        keys.push(Pubkey::from(raw));
+    }
+    Some(keys)
+}
+
 /// Yellowstone 交易签名原始字节（64）→ `solana_sdk::signature::Signature`。
 #[inline]
 pub fn try_yellowstone_signature(sig: &[u8]) -> Option<Signature> {
@@ -243,7 +337,7 @@ pub fn try_yellowstone_signature(sig: &[u8]) -> Option<Signature> {
 mod tests {
     use super::*;
     use crate::core::events::PumpFunTradeEvent;
-    use yellowstone_grpc_proto::prelude::Message;
+    use yellowstone_grpc_proto::prelude::{Message, TokenBalance};
 
     #[test]
     fn fills_outer_fee_payer_without_overwriting_pumpfun_user() {
@@ -268,5 +362,90 @@ mod tests {
         };
         assert_eq!(event.user, inner_user);
         assert_eq!(event.transaction_fee_payer, fee_payer);
+    }
+
+    #[test]
+    fn restores_distinct_users_for_batched_pumpfun_trades() {
+        let fee_payer = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let ata_a = Pubkey::new_unique();
+        let ata_b = Pubkey::new_unique();
+        let owner_a = Pubkey::new_unique();
+        let owner_b = Pubkey::new_unique();
+        let tx = Some(Transaction {
+            message: Some(Message {
+                account_keys: vec![
+                    fee_payer.to_bytes().to_vec(),
+                    ata_a.to_bytes().to_vec(),
+                    ata_b.to_bytes().to_vec(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let token_balance = |account_index, owner: Pubkey| TokenBalance {
+            account_index,
+            mint: mint.to_string(),
+            owner: owner.to_string(),
+            ..Default::default()
+        };
+        let meta = TransactionStatusMeta {
+            pre_token_balances: vec![token_balance(1, owner_a), token_balance(2, owner_b)],
+            ..Default::default()
+        };
+        let wrong_outer_user = fee_payer;
+        let mut events = vec![
+            DexEvent::PumpFunSell(PumpFunTradeEvent {
+                mint,
+                user: wrong_outer_user,
+                associated_user: ata_a,
+                is_buy: false,
+                ..Default::default()
+            }),
+            DexEvent::PumpFunSell(PumpFunTradeEvent {
+                mint,
+                user: wrong_outer_user,
+                associated_user: ata_b,
+                is_buy: false,
+                ..Default::default()
+            }),
+        ];
+
+        fill_pumpfun_instruction_users_from_token_balances(&mut events, &tx, &meta);
+
+        let users: Vec<Pubkey> = events
+            .iter()
+            .map(|event| match event {
+                DexEvent::PumpFunSell(e) => e.user,
+                _ => panic!("expected PumpFunSell"),
+            })
+            .collect();
+        assert_eq!(users, vec![owner_a, owner_b]);
+
+        let log_events = vec![
+            DexEvent::PumpFunTrade(PumpFunTradeEvent {
+                mint,
+                user: owner_a,
+                is_buy: false,
+                ..Default::default()
+            }),
+            DexEvent::PumpFunTrade(PumpFunTradeEvent {
+                mint,
+                user: owner_b,
+                is_buy: false,
+                ..Default::default()
+            }),
+        ];
+        let merged =
+            crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, events);
+        assert_eq!(merged.len(), 2, "批量交易的 log/ix 双路事件应各合并为一条");
+        let merged_users: Vec<Pubkey> = merged
+            .iter()
+            .map(|event| match event {
+                DexEvent::PumpFunTrade(e) => e.user,
+                _ => panic!("expected canonical PumpFunTrade"),
+            })
+            .collect();
+        assert_eq!(merged_users, vec![owner_a, owner_b]);
     }
 }

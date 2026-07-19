@@ -43,7 +43,7 @@ pub(crate) fn parse_transaction_core(
     let slot = tx.slot;
     let idx = info.index;
 
-    let (log_events, instr_events) = rayon::join(
+    let (log_events, mut instr_events) = rayon::join(
         || {
             parse_logs(
                 meta,
@@ -60,6 +60,11 @@ pub(crate) fn parse_transaction_core(
         || parse_instructions(meta, &info.transaction, sig, slot, idx, block_us, grpc_us, filter),
     );
 
+    crate::grpc::transaction_meta::fill_pumpfun_instruction_users_from_token_balances(
+        &mut instr_events,
+        &info.transaction,
+        meta,
+    );
     let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
     crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
@@ -116,9 +121,14 @@ fn parse_transaction_core_sequential(
         grpc_us,
         filter,
     );
-    let instr_events =
+    let mut instr_events =
         parse_instructions(meta, &info.transaction, sig, slot, idx, block_us, grpc_us, filter);
 
+    crate::grpc::transaction_meta::fill_pumpfun_instruction_users_from_token_balances(
+        &mut instr_events,
+        &info.transaction,
+        meta,
+    );
     let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
     crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
