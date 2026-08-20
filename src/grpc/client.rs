@@ -583,11 +583,21 @@ fn parse_transaction_core(
         grpc_us,
         filter,
     );
-    let instr_events =
+    let mut instr_events =
         parse_instructions(meta, &info.transaction, sig, slot, idx, block_us, grpc_us, filter);
 
+    crate::grpc::transaction_meta::fill_pumpfun_instruction_users_from_token_balances(
+        &mut instr_events,
+        &info.transaction,
+        meta,
+    );
     let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
+    crate::grpc::transaction_meta::fill_pumpfun_routed_sell_users_from_signer_token_deltas(
+        &mut events,
+        &info.transaction,
+        meta,
+    );
     crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
         &mut events,
         &info.transaction,

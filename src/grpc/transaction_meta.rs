@@ -301,6 +301,124 @@ pub(crate) fn fill_pumpfun_instruction_users_from_token_balances(
     }
 }
 
+/// 用外层签名者在目标 mint 上的净减仓，修正聚合路由 PumpFun 卖出的真实用户。
+///
+/// 聚合器通常先把 leader 的 token 转入临时账户，再以内层 PDA 调用 PumpFun Sell。
+/// 此时 TradeEvent.user / associated_user owner 都是路由账户，无法与真实 leader 对上；
+/// 但交易 meta 里仍能看到某个外层签名者的该 mint 总余额恰好减少。只有当同一 mint
+/// 存在唯一、且净减仓足以覆盖本交易 PumpFun 卖出量的签名者时才修正，歧义场景保持原值。
+pub(crate) fn fill_pumpfun_routed_sell_users_from_signer_token_deltas(
+    events: &mut [DexEvent],
+    tx: &Option<Transaction>,
+    meta: &TransactionStatusMeta,
+) {
+    let Some(message) = tx.as_ref().and_then(|transaction| transaction.message.as_ref()) else {
+        return;
+    };
+    let required_signatures = message
+        .header
+        .as_ref()
+        .map(|header| header.num_required_signatures as usize)
+        .unwrap_or(0)
+        .min(message.account_keys.len());
+    if required_signatures == 0 {
+        return;
+    }
+
+    let signers: HashSet<Pubkey> = message.account_keys[..required_signatures]
+        .iter()
+        .map(|bytes| read_pubkey_fast(bytes.as_slice()))
+        .filter(|key| *key != Pubkey::default())
+        .collect();
+    if signers.is_empty() {
+        return;
+    }
+
+    let mut total_sell_by_mint = HashMap::<Pubkey, u128>::new();
+    for event in events.iter() {
+        let trade = match event {
+            DexEvent::PumpFunTrade(e)
+            | DexEvent::PumpFunBuy(e)
+            | DexEvent::PumpFunSell(e)
+            | DexEvent::PumpFunBuyExactSolIn(e) => e,
+            _ => continue,
+        };
+        if !trade.is_buy && trade.token_amount > 0 {
+            *total_sell_by_mint.entry(trade.mint).or_insert(0) += trade.token_amount as u128;
+        }
+    }
+    if total_sell_by_mint.is_empty() {
+        return;
+    }
+
+    let mut pre_by_owner_mint = HashMap::<(Pubkey, Pubkey), u128>::new();
+    let mut post_by_owner_mint = HashMap::<(Pubkey, Pubkey), u128>::new();
+    for (balances, target) in [
+        (meta.pre_token_balances.as_slice(), &mut pre_by_owner_mint),
+        (meta.post_token_balances.as_slice(), &mut post_by_owner_mint),
+    ] {
+        for balance in balances {
+            let Ok(owner) = balance.owner.parse::<Pubkey>() else {
+                continue;
+            };
+            if !signers.contains(&owner) {
+                continue;
+            }
+            let Ok(mint) = balance.mint.parse::<Pubkey>() else {
+                continue;
+            };
+            *target.entry((owner, mint)).or_insert(0) += token_balance_raw_amount(balance) as u128;
+        }
+    }
+
+    let mut attributed_signer_by_mint = HashMap::<Pubkey, Pubkey>::new();
+    for (mint, total_sell) in total_sell_by_mint {
+        let mut candidates = signers.iter().filter_map(|signer| {
+            let key = (*signer, mint);
+            let pre = pre_by_owner_mint.get(&key).copied().unwrap_or(0);
+            let post = post_by_owner_mint.get(&key).copied().unwrap_or(0);
+            let decrease = pre.saturating_sub(post);
+            (decrease >= total_sell).then_some(*signer)
+        });
+        let Some(candidate) = candidates.next() else {
+            continue;
+        };
+        if candidates.next().is_none() {
+            attributed_signer_by_mint.insert(mint, candidate);
+        }
+    }
+
+    for event in events {
+        let trade = match event {
+            DexEvent::PumpFunTrade(e)
+            | DexEvent::PumpFunBuy(e)
+            | DexEvent::PumpFunSell(e)
+            | DexEvent::PumpFunBuyExactSolIn(e) => e,
+            _ => continue,
+        };
+        if trade.is_buy {
+            continue;
+        }
+        let Some(real_user) = attributed_signer_by_mint.get(&trade.mint).copied() else {
+            continue;
+        };
+        if trade.user != real_user {
+            tracing::info!(
+                target: "parser_user_fix",
+                "pumpfun_routed_sell_user_corrected: signature={} mint={} old_user={} real_user={} token_amount={} slot={} tx_index={}",
+                trade.metadata.signature,
+                trade.mint,
+                trade.user,
+                real_user,
+                trade.token_amount,
+                trade.metadata.slot,
+                trade.metadata.tx_index,
+            );
+            trade.user = real_user;
+        }
+    }
+}
+
 fn collect_account_keys_pubkeys(
     tx: &Option<Transaction>,
     meta: &TransactionStatusMeta,
@@ -337,7 +455,20 @@ pub fn try_yellowstone_signature(sig: &[u8]) -> Option<Signature> {
 mod tests {
     use super::*;
     use crate::core::events::PumpFunTradeEvent;
-    use yellowstone_grpc_proto::prelude::{Message, TokenBalance};
+    use yellowstone_grpc_proto::prelude::{Message, MessageHeader, TokenBalance, UiTokenAmount};
+
+    fn token_balance(account_index: u32, mint: Pubkey, owner: Pubkey, amount: u64) -> TokenBalance {
+        TokenBalance {
+            account_index,
+            mint: mint.to_string(),
+            owner: owner.to_string(),
+            ui_token_amount: Some(UiTokenAmount {
+                amount: amount.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn fills_outer_fee_payer_without_overwriting_pumpfun_user() {
@@ -447,5 +578,139 @@ mod tests {
             })
             .collect();
         assert_eq!(merged_users, vec![owner_a, owner_b]);
+    }
+
+    #[test]
+    fn restores_routed_sell_user_from_unique_signer_token_decrease() {
+        let fee_payer = Pubkey::new_unique();
+        let leader = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let leader_ata = Pubkey::new_unique();
+        let router_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let tx = Some(Transaction {
+            message: Some(Message {
+                header: Some(MessageHeader { num_required_signatures: 2, ..Default::default() }),
+                account_keys: vec![
+                    fee_payer.to_bytes().to_vec(),
+                    leader.to_bytes().to_vec(),
+                    leader_ata.to_bytes().to_vec(),
+                    router_ata.to_bytes().to_vec(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let meta = TransactionStatusMeta {
+            pre_token_balances: vec![
+                token_balance(2, mint, leader, 1_000),
+                token_balance(3, mint, router, 0),
+            ],
+            post_token_balances: vec![
+                token_balance(2, mint, leader, 500),
+                token_balance(3, mint, router, 0),
+            ],
+            ..Default::default()
+        };
+        let mut events = vec![DexEvent::PumpFunSell(PumpFunTradeEvent {
+            mint,
+            user: router,
+            associated_user: router_ata,
+            token_amount: 500,
+            is_buy: false,
+            ..Default::default()
+        })];
+
+        fill_pumpfun_routed_sell_users_from_signer_token_deltas(&mut events, &tx, &meta);
+
+        let DexEvent::PumpFunSell(event) = &events[0] else {
+            panic!("expected PumpFunSell");
+        };
+        assert_eq!(event.user, leader);
+    }
+
+    #[test]
+    fn routed_sell_attribution_keeps_user_when_decreasing_owner_is_not_signer() {
+        let fee_payer = Pubkey::new_unique();
+        let leader = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let router_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let tx = Some(Transaction {
+            message: Some(Message {
+                header: Some(MessageHeader { num_required_signatures: 1, ..Default::default() }),
+                account_keys: vec![fee_payer.to_bytes().to_vec(), router_ata.to_bytes().to_vec()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let meta = TransactionStatusMeta {
+            pre_token_balances: vec![token_balance(1, mint, leader, 1_000)],
+            post_token_balances: vec![token_balance(1, mint, leader, 500)],
+            ..Default::default()
+        };
+        let mut events = vec![DexEvent::PumpFunSell(PumpFunTradeEvent {
+            mint,
+            user: router,
+            associated_user: router_ata,
+            token_amount: 500,
+            is_buy: false,
+            ..Default::default()
+        })];
+
+        fill_pumpfun_routed_sell_users_from_signer_token_deltas(&mut events, &tx, &meta);
+
+        let DexEvent::PumpFunSell(event) = &events[0] else {
+            panic!("expected PumpFunSell");
+        };
+        assert_eq!(event.user, router);
+    }
+
+    #[test]
+    fn routed_sell_attribution_keeps_user_when_multiple_signers_are_ambiguous() {
+        let signer_a = Pubkey::new_unique();
+        let signer_b = Pubkey::new_unique();
+        let router = Pubkey::new_unique();
+        let ata_a = Pubkey::new_unique();
+        let ata_b = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let tx = Some(Transaction {
+            message: Some(Message {
+                header: Some(MessageHeader { num_required_signatures: 2, ..Default::default() }),
+                account_keys: vec![
+                    signer_a.to_bytes().to_vec(),
+                    signer_b.to_bytes().to_vec(),
+                    ata_a.to_bytes().to_vec(),
+                    ata_b.to_bytes().to_vec(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let meta = TransactionStatusMeta {
+            pre_token_balances: vec![
+                token_balance(2, mint, signer_a, 1_000),
+                token_balance(3, mint, signer_b, 1_000),
+            ],
+            post_token_balances: vec![
+                token_balance(2, mint, signer_a, 500),
+                token_balance(3, mint, signer_b, 500),
+            ],
+            ..Default::default()
+        };
+        let mut events = vec![DexEvent::PumpFunSell(PumpFunTradeEvent {
+            mint,
+            user: router,
+            token_amount: 500,
+            is_buy: false,
+            ..Default::default()
+        })];
+
+        fill_pumpfun_routed_sell_users_from_signer_token_deltas(&mut events, &tx, &meta);
+
+        let DexEvent::PumpFunSell(event) = &events[0] else {
+            panic!("expected PumpFunSell");
+        };
+        assert_eq!(event.user, router);
     }
 }

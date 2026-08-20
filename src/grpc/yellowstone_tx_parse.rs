@@ -67,6 +67,11 @@ pub(crate) fn parse_transaction_core(
     );
     let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
+    crate::grpc::transaction_meta::fill_pumpfun_routed_sell_users_from_signer_token_deltas(
+        &mut events,
+        &info.transaction,
+        meta,
+    );
     crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
         &mut events,
         &info.transaction,
@@ -131,6 +136,11 @@ fn parse_transaction_core_sequential(
     );
     let mut events =
         crate::grpc::log_instr_dedup::dedupe_log_instruction_events(log_events, instr_events);
+    crate::grpc::transaction_meta::fill_pumpfun_routed_sell_users_from_signer_token_deltas(
+        &mut events,
+        &info.transaction,
+        meta,
+    );
     crate::grpc::transaction_meta::fill_pumpfun_transaction_fee_payer(
         &mut events,
         &info.transaction,
